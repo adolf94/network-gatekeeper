@@ -5,8 +5,10 @@
 > scripts/admin-page.html, offline verification in tests/test_admin.py
 > (all green; tests/test_render.py unaffected). Guest passes are 4/12/24 h
 > (full Telegram parity). **The live gate is the container world**
-> (cutover ~2026-11-17), so deployment = `sudo docker compose build core
-> && sudo docker compose up -d core` with the ADMIN_* knobs in
+> (cutover ~2026-11-17), so deployment = push to master (GitHub Actions
+> builds to GHCR, gh_webhooks recreates the stack) or manually
+> `sudo docker compose pull && sudo docker compose up -d core`, with the
+> ADMIN_* knobs in
 > /etc/doorbell.env (the compose `env_file:`; unset token = disabled).
 > Remaining: VER-2 lab matrix on the veth rig; VER-4 go-live via the
 > tunnel; record the SEC-8 bind decision when you make it.

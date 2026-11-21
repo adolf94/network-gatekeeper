@@ -1,0 +1,135 @@
+# Network Gatekeeper — build, push to GHCR, deploy via gh_webhooks.
+#
+# Flow: offline tests → build & push ghcr.io/adolf94/network-gatekeeper →
+# POST an HMAC-signed payload to the homelab webhook
+# (https://apis.adolfrey.com/gh_webhooks/d), which runs
+# `docker compose pull && docker compose up -d --no-deps --wait` in the
+# gatekeeper's compose project on the homelab host (deploy_config.json).
+#
+# Tag invariant: the POSTed tag is the full commit SHA — it MUST match a tag
+# the build actually pushed (metadata-action `type=raw,value=${{ github.sha }}`).
+#
+# Deploy policy: MANUAL GATE — pushes to master only build & push the image
+# (no deploy POST). Deploy the homelab explicitly via workflow_dispatch with
+# deploy=true (the DHCP front door should never redeploy as a side effect of
+# a routine push).
+#
+# Required repo secrets (none are set yet — add all three):
+#   CF_ACCESS_CLIENT_ID      Cloudflare Access service token — Client ID
+#   CF_ACCESS_CLIENT_SECRET  Cloudflare Access service token — Client Secret
+#   HOMELAB_WEBHOOK_SECRET   HMAC secret, same value as the webhook's WEBHOOK_SECRET
+#
+# `pull_request` runs tests only — no image, no deploy.
+
+name: Build & deploy (GHCR + gh_webhooks)
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to homelab via webhook (push to GHCR always happens)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Offline tests (renderer + admin page)
+        run: |
+          python3 tests/test_render.py
+          python3 tests/test_admin.py
+
+  build:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ github.sha }}
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.title=${{ github.repository }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Image digest
+        run: echo "Pushed ${{ steps.meta.outputs.tags }} @ ${{ steps.build.outputs.digest }}"
+
+  deploy:
+    needs: build
+    if: inputs.deploy == true
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read            # the webhook pulls this (likely private) package with this token
+    steps:
+      - name: Trigger homelab deploy webhook (gh_webhooks)
+        env:
+          CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          HOOK_SECRET: ${{ secrets.HOMELAB_WEBHOOK_SECRET }}
+          GH_TOKEN: ${{ github.token }}   # auto-injected, not a repo secret
+          ACTOR: ${{ github.actor }}
+        run: |
+          # Alignment invariant: tag must equal a tag the build pushed (full SHA)
+          TAG="${{ github.sha }}"
+          BODY=$(jq -nc --arg repo "${{ github.repository }}" --arg tag "$TAG" \
+                      --arg user "$ACTOR" --arg token "$GH_TOKEN" \
+                      '{repo:$repo, tag:$tag, user:$user, token:$token}')
+          TS=$(date +%s)
+          SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$HOOK_SECRET" -r | cut -d' ' -f1)
+          BODY_FILE=$(mktemp)              # send from a file so curl can retry
+          trap 'rm -f "$BODY_FILE"' EXIT   # and the token stays out of argv (ps)
+          printf '%s' "$BODY" > "$BODY_FILE"
+          curl -sf --retry 3 --max-time 30 \
+            -H "CF-Access-Client-Id: $CLIENT_ID" \
+            -H "CF-Access-Client-Secret: $CLIENT_SECRET" \
+            -H "X-Timestamp: $TS" -H "X-Signature: $SIG" \
+            -H "Content-Type: application/json" --data-binary @"$BODY_FILE" \
+            https://apis.adolfrey.com/gh_webhooks/d

@@ -4,7 +4,9 @@
 > LIVE (cutover ~2026-11-17: `gatekeeper-core` + `gatekeeper-portal` on
 > `docker ps`; systemd units disabled). Phases 5/6 scripts remain for
 > lab/rollback reference. **Post-cutover code deploys go through Docker**
-> (`docker compose build core && up -d core`, runbook below) — `deploy.sh`
+> (`docker compose pull && up -d` — image built by GitHub Actions and
+> pushed to GHCR; gh_webhooks deploys on push to master, runbook below) —
+> `deploy.sh`
 > now refuses to run while the container world is live (a systemd-side
 > deploy re-activates the old doorbell: two Telegram pollers = 409
 > conflicts, decisions land in the dead world's conf/DB — verified the
@@ -198,7 +200,7 @@ ip netns exec dhcplab ip link set lo up && ip netns exec dhcplab ip link set vet
 
 | Situation | Action |
 |---|---|
-| Deploy a code change | Edit script → `docker compose build && docker compose up -d core` |
+| Deploy a code change | Push to master — Actions tests → builds → POSTs gh_webhooks → `pull && up -d` here. Manual fallback: `docker compose pull && docker compose up -d core` |
 | Inspect DHCP logs | `docker logs -f core` (dnsmasq + doorbell) or `./log/dnsmasq.log` |
 | Portal logs | `docker logs -f portal` |
 | Editing device set | Via Telegram buttons only — the conf is generated; never hand-edit |

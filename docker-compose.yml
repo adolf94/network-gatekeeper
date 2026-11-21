@@ -9,11 +9,17 @@
 # Cutover (Phase 6):  sudo ./scripts/cutover.sh   — never run both worlds.
 # Rollback:           sudo ./scripts/rollback.sh
 # Lab test (Phase 5): sudo ./scripts/lab-test.sh
+#
+# Image source: ghcr.io/adolf94/network-gatekeeper, built by GitHub Actions.
+# gh_webhooks deploys inject IMAGE=ghcr.io/adolf94/network-gatekeeper:<sha>
+# and run `docker compose pull && up -d --no-deps --wait` here; manual runs
+# fall back to the registry's :latest (docker login ghcr.io once for a
+# private package). There is intentionally no `build:` — a stale local
+# rebuild must never shadow the registry image.
 
 services:
   core:
-    build: .
-    image: gatekeeper-core:latest
+    image: ${IMAGE:-ghcr.io/adolf94/network-gatekeeper:latest}
     container_name: gatekeeper-core
     network_mode: host
     restart: unless-stopped
@@ -44,9 +50,18 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+    healthcheck:
+      # supervisorctl status exits non-zero unless every program is RUNNING —
+      # proves dnsmasq + doorbell are actually alive. This is what the
+      # webhook's `up --wait` gates a deploy on (not just "container running").
+      test: ["CMD-SHELL", "supervisorctl -c /etc/supervisor/conf.d/gatekeeper-core.conf status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   portal:
-    image: gatekeeper-core:latest
+    image: ${IMAGE:-ghcr.io/adolf94/network-gatekeeper:latest}
     container_name: gatekeeper-portal
     network_mode: host
     restart: unless-stopped
@@ -66,3 +81,11 @@ services:
       options:
         max-size: 5m
         max-file: "3"
+    healthcheck:
+      # fetch the portal's own page on its bind IP — keep in sync with
+      # PORTAL_BIND/PORTAL_PORT above if they ever change
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://192.168.214.2:80/\", timeout=3)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
