@@ -418,15 +418,24 @@ def main():
                 async with httpx.AsyncClient(transport=transport,
                                              base_url="http://testserver") \
                         as c:
-                    return (
-                        await c.get("/api/authmode"),
-                        await c.get("/api/summary"),
-                        await c.get("/api/summary", headers={
-                            "Authorization": f"Bearer {TOKEN}"}),
-                        await c.get("/auth/login", follow_redirects=False),
-                    )
+                    r_mode = await c.get("/api/authmode")
+                    r_401 = await c.get("/api/summary")
+                    r_bearer = await c.get("/api/summary", headers={
+                        "Authorization": f"Bearer {TOKEN}"})
+                    try:
+                        # Expect a 5xx — the route dials the (unreachable)
+                        # fake authority. Depending on the ASGI stack the
+                        # error may also surface as a raised exception
+                        # after the 500 was sent (ServerErrorMiddleware
+                        # re-raises); both prove the route exists.
+                        r_login = await c.get("/auth/login",
+                                              follow_redirects=False)
+                        login_exists = r_login.status_code != 404
+                    except Exception:
+                        login_exists = True
+                    return r_mode, r_401, r_bearer, login_exists
 
-            r_mode, r_401, r_bearer, r_login = asyncio.run(_drive())
+            r_mode, r_401, r_bearer, login_exists = asyncio.run(_drive())
             check("authmode advertises oauth when the BFF is on",
                   r_mode.json().get("oauth") is True)
             check("API still gated with the BFF on: no creds -> 401",
@@ -434,8 +443,8 @@ def main():
             check("ADMIN_TOKEN bearer still wins with the BFF on",
                   r_bearer.status_code == 200 and r_bearer.json()["ok"])
             check("SDK owns /auth/login when the BFF is on "
-                  "(fake authority -> 5xx, not 404)",
-                  r_login.status_code != 404)
+                  "(fake authority -> 5xx/raise, not 404)",
+                  login_exists)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

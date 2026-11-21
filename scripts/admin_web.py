@@ -377,8 +377,14 @@ def build_admin_app(g):
     try:
         from contextlib import asynccontextmanager
 
-        from fastapi import Depends, FastAPI, HTTPException, Request
+        from fastapi import Depends, FastAPI, Request
         from fastapi.responses import HTMLResponse, JSONResponse
+        # The envelope must catch BOTH exception lineages: fastapi's
+        # HTTPException (our raises) and starlette's base class — the
+        # ar-auth SDK raises the latter (bff.py imports it from
+        # starlette.exceptions), and a handler keyed on fastapi's subclass
+        # is invisible to it (the MRO walk starts at the raised class).
+        from starlette.exceptions import HTTPException
     except ImportError as e:
         g.log(f"admin disabled — the admin stack (fastapi/uvicorn) is not "
               f"installed: {e}")
