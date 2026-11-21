@@ -1,0 +1,64 @@
+# ============================================================
+# gatekeeper.template — STATIC part of the dnsmasq gatekeeper config
+#
+# The full live config = THIS FILE + device lines rendered by the
+# doorbell from the SQLite bindings table (see CONTAINER.md Phase 2).
+# Do NOT put dhcp-host lines here — they are generated; approve or
+# deny devices via the Telegram buttons (or the DB). Edit the static
+# settings below, then reload/restart dnsmasq as usual.
+#
+# Philosophy: no device gets an IP unless it is approved. Unknown
+# (not-yet-decided) devices land in the PENDING waiting room on
+# 192.168.214.0/24 — an IP, but no gateway, no real DNS, and every
+# name resolves to the portal at 192.168.214.2. Denied devices get
+# nothing at all (APIPA limbo).
+#
+# Inventory taken 2026-11-15 (ping sweep + arp + mDNS, see PLAN.md).
+# Doorbell decisions recorded 2026-11-16 (see doorbell log for history).
+# ============================================================
+
+# ---- DNS: served ONLY to pending clients on the gate interface ----
+# Approved clients are told 1.1.1.1/1.0.0.1 directly (option 6 below) and
+# never query us; this PC resolves via systemd-resolved as always.
+# (resolved owns 127.0.0.x:53 on lo; except-interface avoids that.)
+port=53
+except-interface=lo
+no-resolv
+no-hosts
+
+# ---- Gate interface ----
+# This PC serves over Wi-Fi for now; add/switch to eno1 when cabled.
+# It holds 192.168.213.2/24 (gate) and 192.168.214.2/24 (pending gate)
+# as static addresses at the OS level.
+interface=wlx40a5ef262b87
+bind-dynamic
+
+# ---- Approved: static leases only, no allocation from ranges ----
+dhcp-range=192.168.213.0,static
+dhcp-authoritative
+dhcp-leasefile=/var/lib/misc/dnsmasq.leases
+
+# ---- Pending waiting room: 192.168.214.100–.149, 2-min leases ----
+# Unknown MACs (no dhcp-host line) get a lease here and the "pending" tag.
+# 2-min leases mean an approval takes effect within ~2 minutes.
+dhcp-range=set:pending,192.168.214.100,192.168.214.149,2m
+
+# ---- What approved clients are told ----
+dhcp-option=option:router,192.168.213.1
+dhcp-option=option:dns-server,1.1.1.1,192.168.1.1
+
+# ---- What PENDING clients are told ----
+# no default route (option 3 suppressed): they cannot reach the internet
+dhcp-option=tag:pending,3
+# their resolver is us, and every name answers with the portal
+dhcp-option=tag:pending,option:dns-server,192.168.214.2
+address=/#/192.168.214.2
+
+# ---- Logging: DHCP events go to the journal / dnsmasq.log
+# (the doorbell's NAK watcher tails one or the other) ----
+log-dhcp
+
+# ============================================================
+# (The doorbell appends the GENERATED device section here:
+#  approvals, denials, guest passes — rendered from the DB.)
+# ============================================================

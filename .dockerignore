@@ -1,0 +1,18 @@
+# The image needs only the scripts and the supervisord config; everything
+# else is either bind-mounted at runtime or irrelevant to the build.
+.git
+**/__pycache__
+*.md
+backup/
+config/
+leases/
+state/
+log/
+lab/
+systemd/
+tests/
+scripts/lab-test.sh
+scripts/cutover.sh
+scripts/rollback.sh
+scripts/deploy.sh
+docker-compose.yml

@@ -1,0 +1,35 @@
+# ————— runtime state, never source of truth —————
+# Decisions live in state/gatekeeper.db (bind-mounted into the container);
+# it is SQLite + WAL and meaningless outside this box.
+state/
+# Live dnsmasq leasefile (bind-mounted, rewritten by dnsmasq):
+leases/
+# Live logs (dnsmasq.log, doorbell.log — the L-2/L-3 sinks):
+log/
+# Runbook output: conf/doorbell snapshots from deploy.sh + dated backups:
+backup/
+
+# ————— lab rig (CONTAINER.md Phase 5) —————
+# The veth lab's own config/leases/log/state — disposable test state:
+lab/
+
+# ————— renderer temp files —————
+# _atomic_write() stages these next to the target (config/ etc.) for a
+# millisecond before os.replace(); a crash could strand one:
+.gatekeeper.*.tmp
+*.tmp
+
+# ————— python —————
+__pycache__/
+*.pyc
+
+# ————— secrets guard —————
+# Tokens (Telegram, ADMIN_TOKEN) live in /etc/doorbell.env on the gate,
+# root-only, OUTSIDE this repo. This line exists so that a stray env file
+# can never be committed by accident:
+*.env
+.env
+
+# NOTE: config/ stays tracked on purpose — gatekeeper.template is the
+# hand-edited source of truth and gatekeeper.conf is the generated
+# artifact committed for reference (CONTAINER.md Phase 2).

@@ -1,0 +1,36 @@
+# /etc/systemd/system/doorbell.service
+#
+# Network Gatekeeper doorbell — Telegram approve/deny for new devices.
+# Copy to /etc/systemd/system/ then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now doorbell
+#
+# Token + chat id live in /etc/doorbell.env (root, mode 600):
+#   TELEGRAM_BOT_TOKEN=123456:ABC...
+#   TELEGRAM_CHAT_ID=123456789
+
+[Unit]
+Description=Network Gatekeeper doorbell (Telegram approve/deny)
+Documentation=file:///opt/doorbell/doorbell.py
+After=dnsmasq.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/doorbell/doorbell.py
+# Adjust IFACE if the gate moves to a wired NIC (e.g. eno1):
+Environment=IFACE=wlx40a5ef262b87
+Environment=CONFIG=/etc/dnsmasq.d/gatekeeper.conf
+EnvironmentFile=-/etc/doorbell.env
+StateDirectory=gatekeeper
+Restart=on-failure
+RestartSec=10
+
+# Hard-ish limits on a root service:
+ProtectSystem=full
+ReadWritePaths=/etc/dnsmasq.d
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

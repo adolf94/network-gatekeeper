@@ -1,0 +1,68 @@
+# Network Gatekeeper — container deployment (CONTAINER.md Phases 3–4).
+#
+# host networking is MANDATORY: the gate NIC is Wi-Fi (macvlan/bridge can't
+# do 4addr on consumer APs), dnsmasq binds UDP 67/53 on it, the doorbell
+# sniffs DHCP via AF_PACKET on it, and the portal binds the host-owned
+# secondary IP 192.168.214.2. Both containers share the host netns, so the
+# portal's loopback claim relay (127.0.0.1:8333) reaches the core's doorbell.
+#
+# Cutover (Phase 6):  sudo ./scripts/cutover.sh   — never run both worlds.
+# Rollback:           sudo ./scripts/rollback.sh
+# Lab test (Phase 5): sudo ./scripts/lab-test.sh
+
+services:
+  core:
+    build: .
+    image: gatekeeper-core:latest
+    container_name: gatekeeper-core
+    network_mode: host
+    restart: unless-stopped
+    cap_add: [NET_ADMIN, NET_RAW, NET_BIND_SERVICE]
+    # Telegram token/chat (root-only file — run compose via sudo/cutover):
+    env_file: /etc/doorbell.env
+    environment:
+      IFACE: ${IFACE:-wlx40a5ef262b87}
+      # poke dnsmasq inside the container via its supervisor:
+      # (-c: supervisorctl must use OUR socket, not the distro default)
+      DNMSQ_RELOAD: supervisorctl -c /etc/supervisor/conf.d/gatekeeper-core.conf signal HUP dnsmasq
+      DNMSQ_RESTART: supervisorctl -c /etc/supervisor/conf.d/gatekeeper-core.conf restart dnsmasq
+      # the doorbell tails the dnsmasq log file, not journald:
+      LOG_SOURCE: file
+      LOG_FILE: /var/log/gatekeeper/dnsmasq.log
+      # admin page (ADMIN.md): all ADMIN_* knobs (token, bind, port, hosts)
+      # come from /etc/doorbell.env via env_file above. Do NOT list them here:
+      # compose `environment:` overrides `env_file:`, so an interpolated
+      # default here would silently beat the env file's value. Unset token
+      # there = page disabled (INV-5); bind default = loopback (SEC-6/SEC-8).
+    volumes:
+      - ./config:/etc/dnsmasq.d          # rendered conf + template (doorbell writes)
+      - ./leases:/var/lib/misc           # leasefile path stays /var/lib/misc/dnsmasq.leases
+      - ./state:/var/lib/gatekeeper      # SQLite audit trail + bindings
+      - ./log:/var/log/gatekeeper        # dnsmasq log the doorbell tails
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  portal:
+    image: gatekeeper-core:latest
+    container_name: gatekeeper-portal
+    network_mode: host
+    restart: unless-stopped
+    cap_add: [NET_BIND_SERVICE]
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      PORTAL_BIND: 192.168.214.2
+      PORTAL_PORT: "80"
+    volumes:
+      - ./config:/etc/dnsmasq.d:ro       # reads the rendered conf per request
+      - ./leases:/var/lib/misc:ro        # maps waiting-room IPs to MACs
+    command: ["/usr/bin/python3", "/opt/doorbell/pending-portal.py"]
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"

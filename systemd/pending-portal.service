@@ -1,0 +1,32 @@
+# /etc/systemd/system/pending-portal.service
+#
+# Network Gatekeeper "waiting room" portal for pending devices.
+# Copy to /etc/systemd/system/ then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pending-portal
+#
+# Serves the pending page on 192.168.214.2:80. Unprivileged by design:
+# DynamicUser + only CAP_NET_BIND_SERVICE; it reads the dnsmasq leasefile
+# and gatekeeper config (both world-readable) per request.
+
+[Unit]
+Description=Network Gatekeeper pending waiting-room portal
+Documentation=file:///opt/doorbell/pending-portal.py
+After=network-online.target dnsmasq.service
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ExecStart=/usr/bin/python3 /opt/doorbell/pending-portal.py
+Environment=PORTAL_BIND=192.168.214.2
+Environment=PORTAL_PORT=80
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

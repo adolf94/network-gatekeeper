@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Gatekeeper admin</title>
+<style>
+/* Phone-first (V-7): the admin's client is the same phone that gets the
+   Telegram cards. Dark theme matches the waiting-room portal. */
+:root{--bg:#101418;--panel:#1d242b;--line:#39434c;--fg:#e8eaed;--mut:#9aa4ad;
+        --ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--temp:#60a5fa}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+        font-family:system-ui,-apple-system,sans-serif;font-size:16px}
+header{position:sticky;top:0;background:var(--bg);z-index:2;
+        padding:.6rem .9rem 0;border-bottom:1px solid var(--line)}
+header h1{margin:0;font-size:1.15rem;display:flex;gap:.5rem;align-items:baseline}
+#sum{font-size:.8rem;color:var(--mut);display:flex;flex-wrap:wrap;gap:.45rem;
+        padding:.45rem 0 .55rem}
+.chip{background:var(--panel);border:1px solid var(--line);
+        border-radius:99px;padding:.1rem .55rem;white-space:nowrap}
+.chip b{color:var(--fg)}
+nav{display:flex;gap:.4rem;overflow-x:auto;padding:.55rem .9rem;
+        border-bottom:1px solid var(--line);background:var(--bg);
+        position:sticky;top:0;z-index:2}
+nav button{flex:0 0 auto;background:var(--panel);border:1px solid var(--line);
+        color:var(--mut);border-radius:.5rem;padding:.5rem .85rem;
+        font-size:.95rem;cursor:pointer}
+nav button.on{color:var(--fg);border-color:var(--temp);background:#1a2733}
+main{padding:.7rem .9rem 4rem;max-width:52rem;margin:0 auto}
+.bar{display:flex;gap:.45rem;margin:.35rem 0 .7rem;flex-wrap:wrap}
+.bar input,.bar select{background:var(--panel);border:1px solid var(--line);
+        color:var(--fg);border-radius:.45rem;padding:.5rem .6rem;font-size:.95rem}
+.bar input{flex:1 1 9rem;min-width:0}
+.bar select{flex:0 0 auto}
+.row{background:var(--panel);border:1px solid var(--line);border-radius:.6rem;
+        padding:.6rem .7rem;margin-bottom:.55rem;line-height:1.45}
+.row .top{display:flex;justify-content:space-between;gap:.5rem;align-items:baseline}
+.row .nm{font-weight:600;word-break:break-word}
+.row .mut{color:var(--mut);font-size:.82rem;word-break:break-all}
+code{background:#141a20;padding:.08rem .3rem;border-radius:.3rem;font-size:.82em}
+.pill{font-size:.72rem;border-radius:99px;padding:.12rem .5rem;white-space:nowrap}
+.p-approve{background:#10331d;color:var(--ok)}
+.p-deny{background:#38181a;color:var(--bad)}
+.p-temp{background:#12253f;color:var(--temp)}
+.p-raw,.p-pending{background:#262d35;color:var(--mut)}
+.acts{display:flex;gap:.4rem;margin-top:.5rem;flex-wrap:wrap}
+.acts button{min-width:44px;min-height:44px;background:#141a20;
+        border:1px solid var(--line);color:var(--fg);border-radius:.5rem;
+        font-size:1.05rem;cursor:pointer;padding:0 .7rem}
+.acts button:hover{border-color:var(--temp)}
+pre{background:var(--panel);border:1px solid var(--line);border-radius:.6rem;
+        padding:.6rem;font-size:.78rem;overflow-x:auto;white-space:pre-wrap;
+        word-break:break-all;max-height:70vh;overflow-y:auto;margin:0}
+.ev{border-left:3px solid var(--line);padding:.15rem 0 .15rem .6rem;margin:.5rem 0}
+.ev .mut{font-size:.8rem}
+#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:1.1rem;
+        background:#1a2733;border:1px solid var(--temp);border-radius:.6rem;
+        padding:.6rem 1rem;max-width:92vw;display:none;z-index:5;
+        word-break:break-word}
+#toast.bad{border-color:var(--bad);background:#31202a}
+#login{position:fixed;inset:0;background:var(--bg);z-index:9;display:none;
+        align-items:center;justify-content:center}
+#login .box{background:var(--panel);border:1px solid var(--line);
+        border-radius:.8rem;padding:1.4rem;text-align:center;max-width:22rem}
+#login input{width:100%;background:#141a20;border:1px solid var(--line);
+        color:var(--fg);border-radius:.45rem;padding:.6rem;font-size:1rem;margin-top:.8rem}
+#login button{margin-top:.8rem;width:100%}
+button.primary{background:#2563eb;border:none;color:#fff;border-radius:.45rem;
+        padding:.5rem 1rem;font-size:1rem;cursor:pointer}
+.empty{color:var(--mut);text-align:center;padding:1.4rem 0}
+label.auto{display:flex;gap:.4rem;align-items:center;color:var(--mut);font-size:.85rem}
+</style>
+</head>
+<body>
+
+<div id="login"><div class="box">
+  <div style="font-size:2.2rem">🛡️</div>
+  <b>Gatekeeper admin</b>
+  <input id="tok" type="password" placeholder="admin token" autocomplete="off">
+  <button class="primary" onclick="login()">Sign in</button>
+</div></div>
+
+<header>
+  <h1>🛡️ Gatekeeper <span class="mut" style="font-size:.75rem;font-weight:400">
+    <span id="alive"></span></span></h1>
+  <div id="sum"></div>
+</header>
+
+<nav>
+  <button data-tab="devices" class="on">Devices</button>
+  <button data-tab="waiting">Waiting room</button>
+  <button data-tab="events">Events</button>
+  <button data-tab="logs">Logs</button>
+  <button onclick="logout()" title="sign out">⏻</button>
+</nav>
+
+<main>
+  <section id="devices">
+    <div class="bar">
+      <input id="dq" placeholder="search mac / name…">
+      <select id="dstatus">
+        <option value="">all statuses</option>
+        <option>approve</option><option>temp</option><option>deny</option>
+        <option>raw</option><option>pending</option>
+      </select>
+    </div>
+    <div id="devlist"></div>
+  </section>
+
+  <section id="waiting" hidden>
+    <div id="waitlist"></div>
+  </section>
+
+  <section id="events" hidden>
+    <div class="bar">
+      <select id="ekind">
+        <option value="">all kinds</option>
+        <option>knock</option><option>approve</option><option>deny</option>
+        <option>allow</option><option>undo</option><option>skip</option>
+        <option>note</option><option>claim</option><option>purge</option>
+        <option>nak</option><option>ack</option><option>expire</option>
+        <option>migrate</option>
+      </select>
+      <input id="emac" placeholder="filter by mac…">
+      <button class="primary" style="padding:.4rem .7rem" onclick="loadEvents()">Apply</button>
+    </div>
+    <div id="evlist"></div>
+    <div class="bar" style="justify-content:center">
+      <button class="primary" onclick="evOlder()">◀ older</button>
+      <button class="primary" onclick="loadEvents()">⟳ newest</button>
+    </div>
+  </section>
+
+  <section id="logs" hidden>
+    <div class="bar">
+      <select id="lsrc"><option value="doorbell">doorbell</option>
+        <option value="dnsmasq">dnsmasq</option></select>
+      <label class="auto"><input type="checkbox" id="lauto"> auto 10s</label>
+      <button class="primary" onclick="loadLogs()">⟳</button>
+    </div>
+    <pre id="logview">—</pre>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let TAB = "devices", evOffset = 0, authed = false;
+
+/* ---------- plumbing ----------
+   All fetches use RELATIVE paths ("api/..."): the page may be served at /,
+   at http://127.0.0.1:8340/, or behind a reverse-proxy path prefix
+   (Caddy handle_path /gatekeeper/* — the browser URL keeps the prefix),
+   and relative resolution lands on the right upstream in all of them. */
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({headers: {}}, opts));
+  if (r.status === 401) { authed = false; showLogin(); throw new Error("401"); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(j.message || j.error || r.status),
+                                 {j, status: r.status});
+  return j;
+}
+function toast(msg, bad) {
+  const t = $("toast");
+  t.textContent = msg;               // textContent only — device strings stay inert (SEC-4)
+  t.className = bad ? "bad" : ""; t.style.display = "block";
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.style.display = "none", 4000);
+}
+function showLogin() { $("login").style.display = "flex"; }
+async function login() {
+  try {
+    await api("api/login", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({token: $("tok").value})});
+    $("tok").value = ""; authed = true; $("login").style.display = "none";
+    loadAll(); toast("signed in");
+  } catch (e) { toast("login failed — wrong token?", true); }
+}
+async function logout() {
+  try { await api("api/logout", {method: "POST"}); } catch (e) {}
+  authed = false; showLogin();
+}
+$("tok").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
+
+/* ---------- formatting ---------- */
+const esc_kind = k => ({approve: "approved", deny: "denied", temp: "guest pass",
+                        raw: "legacy", pending: "pending"}[k] || k);
+function fmtDur(s) {
+  if (s == null) return "";
+  s = Math.max(0, Math.round(s));
+  if (s < 90) return s + "s";
+  if (s < 5400) return Math.round(s / 60) + "m";
+  if (s < 172800) return Math.round(s / 3600) + "h";
+  return Math.round(s / 86400) + "d";
+}
+function pill(kind) {
+  const s = document.createElement("span");
+  s.className = "pill p-" + kind; s.textContent = esc_kind(kind);
+  return s;
+}
+function macCode(mac) {
+  const c = document.createElement("code"); c.textContent = mac; return c;
+}
+
+/* ---------- actions ---------- */
+async function act(action, mac, hours) {
+  const body = {action, mac};
+  if (hours) body.hours = hours;
+  try {
+    const j = await api("api/action", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    toast(j.warning || `${action} ${mac} ✓`);
+    loadAll();
+  } catch (e) { toast(e.message || "action failed", true); loadAll(); }
+}
+async function rename(mac, current) {
+  const v = prompt("Display name for this device:", current || "");
+  if (v === null) return;
+  try {
+    const j = await api("api/note", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({mac, name: v})});
+    toast(j.warning || `saved: ${j.name}`);
+    loadAll();
+  } catch (e) { toast(e.message || "rename failed", true); loadAll(); }
+}
+function actBtn(label, fn) {
+  const b = document.createElement("button");
+  b.textContent = label; b.onclick = fn; return b;
+}
+
+/* ---------- views ---------- */
+function deviceRow(d) {
+  const row = document.createElement("div"); row.className = "row";
+  const top = document.createElement("div"); top.className = "top";
+  const nm = document.createElement("span"); nm.className = "nm";
+  nm.textContent = d.name || d.claim || d.hostname || "unnamed";
+  top.appendChild(nm); top.appendChild(pill(d.kind));
+  row.appendChild(top);
+
+  const meta = document.createElement("div"); meta.className = "mut";
+  meta.appendChild(macCode(d.mac));
+  if (d.ip) meta.append(" → " + d.ip);
+  if (d.kind === "temp" && d.expires_in != null)
+    meta.append(` · guest pass ends in ${fmtDur(d.expires_in)} (${d.expires})`);
+  if (d.kind === "approve" && d.lease_left != null)
+    meta.append(` · lease ${fmtDur(d.lease_left)} left`);
+  if (d.claim) meta.append(` · claimed “${d.claim}”`);
+  if (d.raw) meta.append(" · raw: ", Object.assign(document.createElement("code"),
+    {textContent: d.raw}));
+  if (d.since) meta.append(` · since ${d.since}`);
+  row.appendChild(meta);
+
+  const acts = document.createElement("div"); acts.className = "acts";
+  if (d.kind !== "approve") acts.appendChild(actBtn("✅", () => act("approve", d.mac)));
+  if (d.kind !== "deny")   acts.appendChild(actBtn("🚫", () => act("deny", d.mac)));
+  if (d.kind !== "temp") {
+    acts.appendChild(actBtn("⏳4h", () => act("allow", d.mac, 4)));
+    acts.appendChild(actBtn("⏳12h", () => act("allow", d.mac, 12)));
+    acts.appendChild(actBtn("⏳24h", () => act("allow", d.mac, 24)));
+  }
+  if (d.kind !== "pending") acts.appendChild(actBtn("↩️", () => act("undo", d.mac)));
+  acts.appendChild(actBtn("😴", () => act("skip", d.mac)));
+  acts.appendChild(actBtn("✏️", () => rename(d.mac, d.name)));
+  row.appendChild(acts);
+  return row;
+}
+function waitRow(w) {
+  const row = document.createElement("div"); row.className = "row";
+  const top = document.createElement("div"); top.className = "top";
+  const nm = document.createElement("span"); nm.className = "nm";
+  nm.textContent = w.name || w.hostname || "unknown device";
+  top.appendChild(nm); top.appendChild(pill("pending"));
+  row.appendChild(top);
+  const meta = document.createElement("div"); meta.className = "mut";
+  meta.appendChild(macCode(w.mac)); meta.append(` → ${w.ip}`);
+  meta.append(` · 2-min lease, ${fmtDur(w.expires_in)} left`);
+  row.appendChild(meta);
+  const acts = document.createElement("div"); acts.className = "acts";
+  acts.appendChild(actBtn("✅", () => act("approve", w.mac)));
+  acts.appendChild(actBtn("🚫", () => act("deny", w.mac)));
+  acts.appendChild(actBtn("⏳4h", () => act("allow", w.mac, 4)));
+  acts.appendChild(actBtn("⏳12h", () => act("allow", w.mac, 12)));
+  acts.appendChild(actBtn("😴", () => act("skip", w.mac)));
+  row.appendChild(acts);
+  return row;
+}
+function evRow(e) {
+  const row = document.createElement("div"); row.className = "ev";
+  const l1 = document.createElement("div");
+  const t = document.createElement("span"); t.textContent = e.ts + " ";
+  t.className = "mut"; l1.appendChild(t);
+  l1.appendChild(pill(e.kind));
+  row.appendChild(l1);
+  const l2 = document.createElement("div"); l2.className = "mut";
+  l2.appendChild(macCode(e.mac));
+  if (e.hostname) l2.append(" " + e.hostname);
+  if (e.detail) l2.append(" — " + e.detail);
+  row.appendChild(l2);
+  return row;
+}
+function empty(msg) {
+  const d = document.createElement("div"); d.className = "empty";
+  d.textContent = msg; return d;
+}
+
+/* ---------- loaders ---------- */
+async function loadSummary() {
+  const j = await api("api/summary");
+  const c = j.counts || {};
+  $("sum").replaceChildren(
+    chip(`✅ ${c.approve || 0}`), chip(`⏳ ${c.temp || 0}`),
+    chip(`🚫 ${c.deny || 0}`), chip(`🛋️ ${j.waiting} waiting`),
+    chip(`🔢 ${j.free_ips} free IPs`),
+    chip(j.dnsmasq_alive ? "dnsmasq: up" : "dnsmasq: DOWN"));
+  $("alive").textContent = j.dnsmasq_alive ? "" : "⚠️ dnsmasq down";
+}
+function chip(text) {
+  const s = document.createElement("span");
+  s.className = "chip"; s.textContent = text; return s;
+}
+async function loadDevices() {
+  const q = encodeURIComponent($("dq").value.trim());
+  const st = encodeURIComponent($("dstatus").value);
+  const j = await api(`api/devices?q=${q}&status=${st}`);
+  const box = $("devlist"); box.replaceChildren();
+  if (!j.devices.length) box.appendChild(empty("no devices match"));
+  for (const d of j.devices) box.appendChild(deviceRow(d));
+}
+async function loadWaiting() {
+  const j = await api("api/pending");
+  const box = $("waitlist"); box.replaceChildren();
+  if (!j.pending.length) box.appendChild(empty("waiting room is empty 🛋️"));
+  for (const w of j.pending) box.appendChild(waitRow(w));
+}
+async function loadEvents() {
+  if (!evOffset) evOffset = 0;
+  const k = encodeURIComponent($("ekind").value);
+  const m = encodeURIComponent($("emac").value.trim());
+  const j = await api(`api/events?kind=${k}&mac=${m}&limit=50&offset=${evOffset}`);
+  const box = $("evlist"); box.replaceChildren();
+  if (!j.events.length) box.appendChild(empty(evOffset ? "no older events" : "no events"));
+  for (const e of j.events) box.appendChild(evRow(e));
+}
+function evOlder() { evOffset += 50; loadEvents(); }
+async function loadLogs() {
+  const j = await api(`api/logs?src=${encodeURIComponent($("lsrc").value)}&lines=300`);
+  $("logview").textContent = j.lines.length
+    ? j.lines.join("\n") : `— no ${$("lsrc").value} log yet —`;
+}
+function loadAll() {
+  if (!authed) return;
+  loadSummary().catch(() => {});
+  if (TAB === "devices") loadDevices().catch(() => {});
+  if (TAB === "waiting") loadWaiting().catch(() => {});
+  if (TAB === "events")  loadEvents().catch(() => {});
+  if (TAB === "logs")    loadLogs().catch(() => {});
+}
+
+/* ---------- tabs + timers ---------- */
+for (const b of document.querySelectorAll("nav button[data-tab]")) {
+  b.onclick = () => {
+    TAB = b.dataset.tab;
+    for (const x of document.querySelectorAll("nav button[data-tab]"))
+      x.classList.toggle("on", x === b);
+    for (const s of document.querySelectorAll("main section"))
+      s.hidden = s.id !== TAB;
+    if (TAB === "events") evOffset = 0;
+    loadAll();
+  };
+}
+let searchT;
+$("dq").addEventListener("input", () => {
+  clearTimeout(searchT); searchT = setTimeout(() => loadDevices().catch(() => {}), 250);
+});
+$("dstatus").addEventListener("change", () => loadDevices().catch(() => {}));
+$("lsrc").addEventListener("change", () => loadLogs().catch(() => {}));
+setInterval(() => {          // roster + waiting room + summary stay fresh (V-6)
+  if (authed && (TAB === "devices" || TAB === "waiting")) loadAll();
+  if (authed && TAB === "logs" && $("lauto").checked) loadLogs().catch(() => {});
+}, 10000);
+
+/* boot: page is public; auth check via the first API call */
+api("api/summary").then(() => { authed = true; loadAll(); })
+                   .catch(() => {});
+</script>
+</body>
+</html>
