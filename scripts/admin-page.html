@@ -67,6 +67,10 @@ pre{background:var(--panel);border:1px solid var(--line);border-radius:.6rem;
 #login input{width:100%;background:#141a20;border:1px solid var(--line);
         color:var(--fg);border-radius:.45rem;padding:.6rem;font-size:1rem;margin-top:.8rem}
 #login button{margin-top:.8rem;width:100%}
+#login .oauthbtn{display:block;margin-top:.9rem;padding:.6rem;
+        border:1px solid var(--temp);border-radius:.45rem;
+        text-decoration:none;color:var(--fg);font-size:.95rem}
+#login .or{color:var(--mut);font-size:.8rem;margin-top:.9rem}
 button.primary{background:#2563eb;border:none;color:#fff;border-radius:.45rem;
         padding:.5rem 1rem;font-size:1rem;cursor:pointer}
 .empty{color:var(--mut);text-align:center;padding:1.4rem 0}
@@ -78,6 +82,9 @@ label.auto{display:flex;gap:.4rem;align-items:center;color:var(--mut);font-size:
 <div id="login"><div class="box">
   <div style="font-size:2.2rem">🛡️</div>
   <b>Gatekeeper admin</b>
+  <a id="oauthlink" class="oauthbtn" style="display:none"
+     href="#">Sign in with ar-auth</a>
+  <div id="orkip" class="or" style="display:none">or use the admin token</div>
   <input id="tok" type="password" placeholder="admin token" autocomplete="off">
   <button class="primary" onclick="login()">Sign in</button>
 </div></div>
@@ -157,6 +164,13 @@ let TAB = "devices", evOffset = 0, authed = false;
    (Caddy handle_path /gatekeeper/* — the browser URL keeps the prefix),
    and relative resolution lands on the right upstream in all of them. */
 async function api(path, opts) {
+  opts = opts || {};
+  // BFF CSRF (ar-auth §4 layer 3): unsafe methods echo the JS-readable
+  // signed XSRF-TOKEN cookie (its name carries the app path prefix).
+  if (/^(POST|PUT|PATCH|DELETE)$/.test(opts.method || "GET")) {
+    const m = document.cookie.match(/(?:^|;\s)([^=;]*XSRF-TOKEN)=([^;]*)/);
+    if (m) opts.headers = Object.assign({"X-CSRF-Token": m[2]}, opts.headers || {});
+  }
   const r = await fetch(path, Object.assign({headers: {}}, opts));
   if (r.status === 401) { authed = false; showLogin(); throw new Error("401"); }
   const j = await r.json().catch(() => ({}));
@@ -170,7 +184,24 @@ function toast(msg, bad) {
   t.className = bad ? "bad" : ""; t.style.display = "block";
   clearTimeout(toast._t); toast._t = setTimeout(() => t.style.display = "none", 4000);
 }
-function showLogin() { $("login").style.display = "flex"; }
+/* OAuth (ar-auth BFF, ADMIN.md SEC-9): sign-in/out are plain navigations.
+   The browser URL keeps Caddy's /gatekeeper prefix, so links rebuild it;
+   returnUrl must land back on the prefixed page, not the host root. */
+let OAUTH = false;
+function authHref(path) {
+  const pre = location.pathname.indexOf("/gatekeeper") === 0 ? "/gatekeeper" : "";
+  return pre + "/" + path + "?returnUrl=" + encodeURIComponent(pre + "/");
+}
+function showLogin() {
+  $("oauthlink").style.display = OAUTH ? "block" : "none";
+  $("orkip").style.display = OAUTH ? "block" : "none";
+  if (OAUTH) $("oauthlink").href = authHref("auth/login");
+  $("login").style.display = "flex";
+}
+fetch("api/authmode").then(r => r.json()).then(j => {
+  OAUTH = !!j.oauth;
+  if ($("login").style.display === "flex") showLogin();
+}).catch(() => {});
 async function login() {
   try {
     await api("api/login", {method: "POST",
@@ -182,7 +213,8 @@ async function login() {
 }
 async function logout() {
   try { await api("api/logout", {method: "POST"}); } catch (e) {}
-  authed = false; showLogin();
+  if (OAUTH) location.href = authHref("auth/logout");  // clears BFF cookies too
+  else { authed = false; showLogin(); }
 }
 $("tok").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
 

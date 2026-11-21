@@ -54,6 +54,7 @@ jobs:
 
       - name: Offline tests (renderer + admin page)
         run: |
+          pip install "ar-auth-python-client[fastapi] @ https://github.com/adolf94/ar-oauth2/releases/download/1.3.0/ar_auth_python_client-1.3.0-py3-none-any.whl" uvicorn
           python3 tests/test_render.py
           python3 tests/test_admin.py
 

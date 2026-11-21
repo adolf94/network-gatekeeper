@@ -5,7 +5,9 @@
 > `docker ps`; systemd units disabled). Phases 5/6 scripts remain for
 > lab/rollback reference. **Post-cutover code deploys go through Docker**
 > (`docker compose pull && up -d` — image built by GitHub Actions and
-> pushed to GHCR; gh_webhooks deploys on push to master, runbook below) —
+> pushed to GHCR; deploys are MANUALLY GATED — workflow_dispatch with
+> deploy=true; a push to master only builds/pushes so the DHCP front door
+> never redeploys as a side effect, runbook below) —
 > `deploy.sh`
 > now refuses to run while the container world is live (a systemd-side
 > deploy re-activates the old doorbell: two Telegram pollers = 409
@@ -200,11 +202,12 @@ ip netns exec dhcplab ip link set lo up && ip netns exec dhcplab ip link set vet
 
 | Situation | Action |
 |---|---|
-| Deploy a code change | Push to master — Actions tests → builds → POSTs gh_webhooks → `pull && up -d` here. Manual fallback: `docker compose pull && docker compose up -d core` |
+| Deploy a code change | Push to master — Actions tests → builds → pushes GHCR. Deploy via workflow_dispatch with `deploy=true` → gh_webhooks POSTs `/d` → `pull && up -d --no-deps --wait` here (manual fallback: `sudo docker compose pull && sudo docker compose up -d core`) |
+| Deploy fails: "Conflict. The container name ... is already in use" | Containers from a *different* compose project hold the fixed `container_name`s (happened once, 2026-11-22: the pre-deploy checkout was its own project). One-time recreate: `docker compose down` in the old checkout (or `docker rm -f gatekeeper-core gatekeeper-portal`), then re-run the deploy. Seconds of dnsmasq-down — covered by the approved devices' 24 h leases. This deploy dir is now the canonical state home (`config/leases/state/log`) |
 | Inspect DHCP logs | `docker logs -f core` (dnsmasq + doorbell) or `./log/dnsmasq.log` |
 | Portal logs | `docker logs -f portal` |
 | Editing device set | Via Telegram buttons only — the conf is generated; never hand-edit |
-| Admin page | `ADMIN_TOKEN` in `/etc/doorbell.env`; disabled when unset. See ADMIN.md (`docker logs -f core` also shows admin/auth lines; page logs land in `./log/doorbell.log`) |
+| Admin page | `ADMIN_TOKEN` and/or `ADMIN_BFF_SECRET` (OAuth, ADMIN.md SEC-9) in `/etc/doorbell.env`; the page is disabled only when BOTH are unset. Web layer: `scripts/admin_web.py` (lazy fastapi/uvicorn in the doorbell process) |
 | docker broken | `systemctl restart docker`; if wedged → rollback sequence above |
 | PC reboot | dockerd + `unless-stopped` bring the gate back; approved leases unaffected |
 

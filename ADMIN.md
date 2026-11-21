@@ -5,13 +5,19 @@
 > scripts/admin-page.html, offline verification in tests/test_admin.py
 > (all green; tests/test_render.py unaffected). Guest passes are 4/12/24 h
 > (full Telegram parity). **The live gate is the container world**
-> (cutover ~2026-11-17), so deployment = push to master (GitHub Actions
-> builds to GHCR, gh_webhooks recreates the stack) or manually
+> (cutover ~2026-11-17), so deployment = GHCR image + gh_webhooks recreate
+> (manually gated: workflow_dispatch with deploy=true; pushes to master
+> only build/push) or manually
 > `sudo docker compose pull && sudo docker compose up -d core`, with the
 > ADMIN_* knobs in
-> /etc/doorbell.env (the compose `env_file:`; unset token = disabled).
+> /etc/doorbell.env (the compose `env_file:`; ADMIN_TOKEN or
+> ADMIN_BFF_SECRET — either enables the page, INV-5).
+> **2026-11-22: OAuth added (SEC-9)** — the admin page now also accepts
+> ar-auth login (auth.adolfrey.com, scope api://network-gatekeeper/admin);
+> the web layer lives in `scripts/admin_web.py`, split from the gate core.
 > Remaining: VER-2 lab matrix on the veth rig; VER-4 go-live via the
-> tunnel; record the SEC-8 bind decision when you make it.
+> tunnel; record the SEC-8 bind decision when you make it; one live
+> OAuth login end-to-end (VER-6, below).
 >
 > **Scope settled:** full action parity with the Telegram buttons · reachable
 > on the approved subnet (`192.168.213.x`) and via the Cloudflare tunnel at
@@ -36,7 +42,7 @@ this page must not break.
 | ID | Invariant | Why |
 |---|---|---|
 | INV-1 | **Single writer.** The only process that writes SQLite or renders `gatekeeper.conf` stays the doorbell. Web actions call the *same functions* the Telegram callbacks call (`db_set_binding` → `render_and_apply` → `purge_leases` → `db_event` → Telegram card). No SQL from the page, no second renderer, no conf edits. | The renderer/conf/audit coupling is the whole point of Phase 2 (CONTAINER.md); a second writer recreates the overwrite-incident class |
-| INV-2 | **Admin server is a thread in the doorbell process** — same pattern as the claim relay (`claim_server`, doorbell-dhcp.py:922). Binds `ADMIN_BIND:ADMIN_PORT` (env), default `127.0.0.1:8340`. **Must never bind `0.0.0.0` or `192.168.214.2`** — the latter is the untrusted waiting room. | Keeps one writer (INV-1) with zero new IPC; the waiting-room roster and `temp_queue` live in doorbell memory and must not be duplicated |
+| INV-2 | **Admin server runs inside the doorbell process** — since 2026-11-22 as `scripts/admin_web.py`, bootstrapped by the doorbell against its own module (uvicorn threads, one per bind; same in-process pattern as the claim relay `claim_server`, doorbell-dhcp.py). Binds `ADMIN_BIND:ADMIN_PORT` (env), default `127.0.0.1:8340`. **Must never bind `0.0.0.0` or `192.168.214.2`** — the latter is the untrusted waiting room. | Keeps one writer (INV-1) with zero new IPC; the waiting-room roster and `temp_queue` live in doorbell memory and must not be duplicated |
 | INV-3 | **Portal untouched.** `pending-portal.py` and its compose service are unchanged. | The portal is the deliberately least-privileged reader (CONTAINER.md decision table) |
 | INV-4 | **Crash isolation.** A dead or hung admin thread must not affect DHCP sniffing, dnsmasq signaling, rendering, or the claim relay. Handler exceptions are logged and swallowed, never propagated into core loops. | The page is the newest, most exposed code; the gate must not feel it |
 | INV-5 | **Kill switch.** If `ADMIN_TOKEN` is unset, the admin thread never starts (one log line: `admin disabled — set ADMIN_TOKEN`); everything else runs normally. | Zero-cost opt-out, and a documented rollback for any admin-page incident |
@@ -58,6 +64,7 @@ hostile**, including ones that didn't come through Cloudflare.
 | SEC-6 | Startup self-check: if `ADMIN_BIND` is `0.0.0.0` or `192.168.214.2`, the admin thread refuses to start and logs why (gate keeps running). |
 | SEC-7 | **Browser auth is a flow, not a header.** Browsers can't send Bearer headers on navigation: the page offers a token login form → the server sets a signed, HttpOnly, `SameSite=Strict` session cookie (short TTL, 12 h suggested); every POST additionally requires an Origin check against the configured hostname allowlist (`ADMIN_HOSTS`). Constant-time compare applies at login; programmatic/automation access keeps the Bearer header. |
 | SEC-8 | **Transport decision — RECORDED (2026-11-21):** the admin binds the **Caddy proxy network's gateway IP** (`ADMIN_BIND=172.20.0.1`), not the LAN. Reachability: the host itself + containers on the `proxy` network (Caddy) — and, because the host routes for them, approved-subnet clients could address the gateway IP directly too; the token + rate limit remain the guard. TLS is terminated at Cloudflare → cloudflared → Caddy, so browser-to-host traffic is encrypted the whole way; Caddy→doorbell is a plain hop across the host's own bridge. LAN clients hitting `https://apis.adolfrey.com` on 443 directly fall into the portal catch-all site, not the admin — so in practice the page is **tunnel-only**, with loopback for debugging. |
+| SEC-9 | **OAuth (ar-auth BFF) — added 2026-11-22.** A third auth leg next to SEC-1/SEC-7: the ar-auth authorization-code flow with PKCE (`scripts/admin_web.py`, SDK `ar-auth-python-client[fastapi]` 1.3.0 from GitHub Releases — the same wheel the Dockerfile installs). The BFF owns `/auth/login|callback|logout`; the session cookie is app-local, HttpOnly, `SameSite=Lax`, `Path=/gatekeeper/` (host-only, path-prefixed names); silent renewal from the parked encrypted refresh token (single-flight); CSRF = Lax + Origin + signed double-submit (`XSRF-TOKEN` cookie echoed by the page as `X-CSRF-Token`). **The gate is the scope:** login requires `api://network-gatekeeper/admin`, verified on the login exchange's ACCESS token — ar-auth id_tokens carry no scopes and the code grant narrows silently, so `ScopeGatedBff` wraps the AuthLib code-exchange call, signature-verifies the access token's `scope` claim, and rejects logins without it (fail closed; missing-grant users bounce back to the login page). Revocation lags up to the refresh chain's life (30 d) — same trade-off as every ar-auth BFF consumer. ADMIN_TOKEN legs unchanged; Bearer always wins precedence. | Same-site cookie rule (ar-oauth2 `docs/cookie-auth-plan.md`): `apis.adolfrey.com` shares the registrable domain with `auth.adolfrey.com` — cookie auth is viable, and no token ever reaches JavaScript |
 
 ---
 
@@ -152,7 +159,12 @@ check green before the next.
 |---|---|---|
 | `ADMIN_BIND` | `127.0.0.1` | **Comma-separated list** — one listener per address, each SEC-6-checked independently (a refused/late-appearing address never blocks the others; the per-bind retry means a secondary IP added later comes up without a restart). Live: `172.20.0.1,192.168.213.2` — never `0.0.0.0` / `214.2` |
 | `ADMIN_PORT` | `8340` | No clash with CLAIM_PORT 8333 / lab 8334 |
-| `ADMIN_TOKEN` | *(unset)* | Unset ⇒ admin disabled (INV-5); lives in `/etc/doorbell.env` next to the Telegram secrets; rotation = edit the file + doorbell restart |
+| `ADMIN_TOKEN` | *(unset)* | Constant-time token legs (Bearer + `gkadmin` cookie login). Unset ⇒ those legs off; the page still runs if `ADMIN_BFF_SECRET` is set. Lives in `/etc/doorbell.env` next to the Telegram secrets; rotation = edit the file + doorbell restart |
+| `ADMIN_BFF_SECRET` | *(unset)* | **OAuth BFF (SEC-9).** Unset ⇒ OAuth leg off, token-only behavior unchanged. Generate once: `python3 -c "import secrets; print(secrets.token_urlsafe(48))"` → `/etc/doorbell.env`. Signs the BFF session/refresh/CSRF cookies — persist it; rotating logs everyone out. Either this or `ADMIN_TOKEN` enables the page (INV-5) |
+| `ADMIN_OAUTH_CLIENT` | `network-gatekeeper` | ar-auth client_id (registered as a PUBLIC client — PKCE, no secret) |
+| `ADMIN_OAUTH_SCOPE` | `api://network-gatekeeper/admin` | Required scope, checked on the login exchange's access token — grant it to the client and your user on the auth server |
+| `ADMIN_OAUTH_BASE` | `https://apis.adolfrey.com/gatekeeper` | Browser-visible base URL (Caddy strips `/gatekeeper/*`). redirect_uri = base + `/auth/callback` — must match the client registration exactly; cookies are scoped to the path |
+| `ADMIN_OAUTH_AUTHORITY` | `auth.adolfrey.com/api` | The ar-auth issuer (SDK default) |
 | `ADMIN_HOSTS` | *(unset)* | Comma-separated hostname allowlist for Origin/Host checks, e.g. `apis.adolfrey.com,apps.adolfrey.com`. Unset ⇒ only direct bind-address access (loopback / 213.x forms) is accepted; any tunnel hostname must be listed explicitly |
 | `DOORBELL_LOG` | `<LOG_FILE dir>/doorbell.log` | The doorbell's second log sink (L-3) — truncated on start; joins the dnsmasq log in `./log` (no separate LOG_DIR knob: the sink always lives beside LOG_FILE) |
 
@@ -192,3 +204,68 @@ browser ─TLS─ Cloudflare ─ cloudflared ─ 127.0.0.1:8080 (caddy)
 - Config lives in `/opt/caddy/Caddyfile` + `/etc/doorbell.env` (root-only,
   not in this repo). Disabling the page remotely = stop cloudflared or unset
   `ADMIN_TOKEN`; the gate never depends on either.
+
+---
+
+## OAuth (SEC-9) — ar-auth login for the admin page
+
+Implemented 2026-11-22; the web layer is `scripts/admin_web.py` (split from
+the gate core — the core stays stdlib-only and imports it lazily, INV-4).
+
+### One-time setup
+
+1. **Auth server (ar-auth dashboard):** register the client —
+   - client_id `network-gatekeeper`, **public client** (no secret; PKCE
+     mandatory — the SDK enforces S256),
+   - redirect URI `https://apis.adolfrey.com/gatekeeper/auth/callback`
+     (exactly; `apps.adolfrey.com` sessions are per-hostname — a second
+     redirect URI for that host works if you want OAuth there too),
+   - allowed scopes include `api://network-gatekeeper/admin`; grant the
+     scope to your user.
+2. **Gate host (`/etc/doorbell.env`):** add
+   `ADMIN_BFF_SECRET=<python3 -c "import secrets; print(secrets.token_urlsafe(48))">`
+   — persist it; every restart without the same secret silently logs
+   everyone out. `ADMIN_TOKEN` may stay (fallback for the plaintext LAN
+   hop + automation) or be dropped.
+3. **Deploy** the new image (Dockerfile now installs the SDK wheel +
+   FastAPI/uvicorn) and restart the doorbell; expect the log line
+   `admin page listening on … (… oauth client network-gatekeeper)`.
+
+### Flow (VER-6 — one live check end-to-end)
+
+Open `https://apis.adolfrey.com/gatekeeper/` → the login dialog offers
+**Sign in with ar-auth** (the page probes `/api/authmode`) → authenticate
+at `auth.adolfrey.com` → back on the page, signed in: session cookie
+`gatekeeper.ar_bff_session` (HttpOnly), parked refresh + readable
+`gatekeeper.XSRF-TOKEN`. One approve via the page proves the whole chain;
+`docker logs gatekeeper-core` shows the action with via-web provenance.
+Sign-out (⏻) clears both worlds (`/auth/logout` + the token cookie).
+
+Failure modes, all fail-closed:
+- **Missing scope grant** — login completes at the auth server but the
+  exchange is rejected: you bounce back to the sign-in link (the auth
+  server's code grant narrows silently; our gate is the access-token
+  scope check). Grant the scope, done.
+- **Auth server unreachable** — the page still loads (warmup is
+  tolerant, unlike the SDK default); sign-in fails until it resolves.
+  The gate is never affected.
+- **Rotated/lost `ADMIN_BFF_SECRET`** — everyone re-logs-in; nothing
+  else breaks. Token legs unaffected.
+
+Kill switches, in order of reach: unset `ADMIN_BFF_SECRET` (OAuth off,
+token legs live) → unset both (page off, INV-5) → stop cloudflared (page
+unreachable, gate fine).
+
+Notes for the future:
+- **Revocation lag:** a granted session silently renews from its parked
+  refresh token for up to 30 days even after a server-side scope/user
+  change — the refreshed id_token carries no scopes to re-check. To cut
+  someone off NOW: rotate `ADMIN_BFF_SECRET`.
+- **Why the scope check wraps the exchange:** ar-auth puts granted scopes
+  on the access token only (backend `TokenService`), and the SDK's
+  `on_authenticated` hook sees id_token claims — so requesting a scope
+  proves nothing. `ScopeGatedBff` wraps (never replaces) the AuthLib
+  exchange; all base BFF security work still runs.
+- **Plaintext LAN hop (`http://192.168.213.2:8340`)**: BFF cookies are
+  `Secure`, so OAuth only works through the tunnel; the token form
+  remains the LAN fallback by design.

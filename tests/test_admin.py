@@ -21,6 +21,8 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE = os.path.join(HERE, "..", "scripts", "doorbell-dhcp.py")
+sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
+import admin_web as aw          # stdlib-only at import — the HTTP stack is lazy
 
 FIXTURE_CONF = """\
 port=53
@@ -96,16 +98,20 @@ def poke_count(env_dir):
 
 
 def http(port, method, path, body=None, headers=None, host="127.0.0.1"):
-    """Returns (status, headers, body-text). Follows no redirects."""
+    """Returns (status, headers, body-text). Follows no redirects.
+    Headers are lower-cased: uvicorn emits 'set-cookie', the stdlib
+    handler used to emit 'Set-Cookie' — tests must not care."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(f"http://{host}:{port}{path}",
                                  data=data, method=method,
                                  headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status, dict(r.headers), r.read().decode()
+            return r.status, {k.lower(): v for k, v in r.headers.items()}, \
+                r.read().decode()
     except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read().decode()
+        return e.code, {k.lower(): v for k, v in e.headers.items()}, \
+            e.read().decode()
 
 
 def wait_port(port, timeout=3.0):
@@ -116,6 +122,19 @@ def wait_port(port, timeout=3.0):
                 return True
         except OSError:
             time.sleep(0.05)
+    return False
+
+
+def wait_admin(port, timeout=20.0):
+    """The socket binds before uvicorn finishes building the app (fastapi
+    import takes a beat) — poll until a request actually gets answered."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            st, _, _ = http(port, "GET", "/api/summary")
+            return st == 401
+        except (urllib.error.URLError, OSError):
+            time.sleep(0.1)
     return False
 
 
@@ -144,34 +163,43 @@ def main():
 
         # ---- pure helpers (VER-1) ------------------------------------------
         check("SEC-6 bind self-check refuses 0.0.0.0",
-              not mod.admin_bind_ok("0.0.0.0"))
+              not aw.admin_bind_ok("0.0.0.0"))
         check("SEC-6 bind self-check refuses the portal IP",
-              not mod.admin_bind_ok("192.168.214.2"))
+              not aw.admin_bind_ok("192.168.214.2"))
         check("SEC-6 bind self-check accepts loopback / 213.x",
-              mod.admin_bind_ok("127.0.0.1") and mod.admin_bind_ok("192.168.213.2"))
+              aw.admin_bind_ok("127.0.0.1") and aw.admin_bind_ok("192.168.213.2"))
         check("VER-5 claim relay pinned loopback-only",
               mod.CLAIM_BIND == "127.0.0.1")
         check("MAC regex accepts colon form only",
-              bool(mod._MAC_RE.fullmatch("aa:bb:cc:dd:ee:ff"))
-              and not mod._MAC_RE.fullmatch("aabbcc.ddee.ff")
-              and not mod._MAC_RE.fullmatch("AA:BB:CC:dd:ee:ff"))
+              bool(aw._MAC_RE.fullmatch("aa:bb:cc:dd:ee:ff"))
+              and not aw._MAC_RE.fullmatch("aabbcc.ddee.ff")
+              and not aw._MAC_RE.fullmatch("AA:BB:CC:dd:ee:ff"))
 
         # ---- session cookie (SEC-7) ----------------------------------------
-        s = mod.make_session()
-        check("session verifies", mod.check_session(s))
+        s = aw.make_session(mod)
+        check("session verifies", aw.check_session(mod, s))
         tampered = s[:-1] + ("0" if s[-1] != "0" else "1")
-        check("tampered session rejected", not mod.check_session(tampered))
+        check("tampered session rejected", not aw.check_session(mod, tampered))
         exp = str(int(time.time()) - 10)
         check("expired session rejected",
-              not mod.check_session(f"{exp}.{mod._sign(exp)}"))
+              not aw.check_session(mod, f"{exp}.{aw._sign(mod, exp)}"))
         wrong = hmac_mod.new(b"other", exp.encode(), "sha256").hexdigest()
         check("signature from another token rejected",
-              not mod.check_session(f"{exp}.{wrong}"))
+              not aw.check_session(mod, f"{exp}.{wrong}"))
 
         # ---- server up ------------------------------------------------------
         import threading
         threading.Thread(target=mod.admin_server, daemon=True).start()
         check("admin server listens", wait_port(port))
+        check("admin server serving requests", wait_admin(port))
+
+        # ---- oauth off (no ADMIN_BFF_SECRET in this boot) -------------------
+        st, _, body = http(port, "GET", "/api/authmode")
+        j = json.loads(body)
+        check("authmode advertises token-only when the BFF is off",
+              st == 200 and j["ok"] and j["oauth"] is False)
+        st, _, _ = http(port, "GET", "/auth/login")
+        check("SDK routes absent when the BFF is off", st == 404)
 
         # ---- multi-bind: one listener per ADMIN_BINDS entry -------------------
         check("bind list parsed from comma-separated env",
@@ -180,7 +208,7 @@ def main():
         check("second bind also listens", st == 401)
         st, h2, _ = http(port, "POST", "/api/login", {"token": TOKEN},
                          host="127.0.0.2")
-        cookie2 = (h2.get("Set-Cookie") or "").split(";")[0]
+        cookie2 = (h2.get("set-cookie") or "").split(";")[0]
         origin2 = {"Cookie": cookie2, "Content-Type": "application/json",
                    "Origin": f"http://127.0.0.2:{port}"}
         st, _, _ = http(port, "POST", "/api/action",
@@ -230,7 +258,7 @@ def main():
 
         # ---- login + cookie + Origin (SEC-2/SEC-7) ---------------------------
         st, hdrs, _ = http(port, "POST", "/api/login", {"token": TOKEN})
-        cookie = (hdrs.get("Set-Cookie") or "").split(";")[0]
+        cookie = (hdrs.get("set-cookie") or "").split(";")[0]
         check("login with right token sets session cookie",
               st == 200 and cookie.startswith("gkadmin="))
         cookie_hdr = {"Cookie": cookie, "Content-Type": "application/json"}
@@ -250,7 +278,7 @@ def main():
             conf_text = f.read()
         check("approve rendered its dhcp-host line",
               f"dhcp-host={NEW_MAC},{NEXT_IP},labphone,24h" in conf_text)
-        evs = mod._admin_events(kind="approve", mac=NEW_MAC)
+        evs = aw._admin_events(mod, kind="approve", mac=NEW_MAC)
         check("approve event recorded with via-web provenance",
               evs and "via web" in evs[0]["detail"] and NEXT_IP in evs[0]["detail"],
               evs[0]["detail"] if evs else "no event")
@@ -282,7 +310,7 @@ def main():
         check("rename via web -> ok", st == 200 and json.loads(body)["ok"])
         with open(conf) as f:
             check("note marker rendered", "# doorbell note: Bob" in f.read())
-        evs = mod._admin_events(kind="note", mac=NEW_MAC)
+        evs = aw._admin_events(mod, kind="note", mac=NEW_MAC)
         check("note event carries via-web provenance",
               evs and evs[0]["detail"] == "Bob via web")
 
@@ -321,7 +349,7 @@ def main():
         with open(conf) as f:
             check("deny rendered ignore line",
                   f"dhcp-host={NEW_MAC},ignore" in f.read())
-        evs = mod._admin_events(kind="deny", mac=NEW_MAC)
+        evs = aw._admin_events(mod, kind="deny", mac=NEW_MAC)
         check("deny event via web", evs and evs[0]["detail"] == "via web")
 
         # ---- events + logs (L-1..L-4) -----------------------------------------
@@ -353,12 +381,61 @@ def main():
               st == 200 and NEW_MAC in mod.cooldown)
         st, hdrs, _ = http(port, "POST", "/api/logout", {}, origin)
         check("logout expires the cookie",
-              st == 200 and "Max-Age=0" in (hdrs.get("Set-Cookie") or ""))
+              st == 200 and "Max-Age=0" in (hdrs.get("set-cookie") or ""))
         for _ in range(5):
             st, _, _ = http(port, "POST", "/api/login", {"token": "nope"})
         st, _, body = http(port, "POST", "/api/login", {"token": "nope"})
         check("6th failed login inside a minute rate-limited -> 403 generic",
               st == 403 and json.loads(body)["error"] == "forbidden")
+
+        # ---- BFF mode (offline): the app builds against a fake authority --
+        # The full login flow needs the real auth server (manual VER step,
+        # ADMIN.md); offline we prove the stack builds, the SDK routes
+        # appear, and the token legs still gate everything with OAuth on.
+        try:
+            import asyncio
+
+            import httpx
+        except ImportError:
+            httpx = None
+        if httpx is None:
+            print("  ⏭ httpx unavailable — skipping the BFF-mode checks")
+        else:
+            os.environ.update(
+                ADMIN_BFF_SECRET="unit-test-secret-" + "x" * 48,
+                ADMIN_OAUTH_AUTHORITY="http://127.0.0.1:9/api")
+            spec2 = importlib.util.spec_from_file_location(
+                "doorbell_oauth", MODULE)
+            mod2 = importlib.util.module_from_spec(spec2)
+            spec2.loader.exec_module(mod2)
+            app = aw.build_admin_app(mod2)
+            check("BFF app builds against a fake authority (no network)",
+                  app is not None)
+
+            async def _drive():
+                # ASGI transport, no lifespan -> no warmup, no network
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(transport=transport,
+                                             base_url="http://testserver") \
+                        as c:
+                    return (
+                        await c.get("/api/authmode"),
+                        await c.get("/api/summary"),
+                        await c.get("/api/summary", headers={
+                            "Authorization": f"Bearer {TOKEN}"}),
+                        await c.get("/auth/login", follow_redirects=False),
+                    )
+
+            r_mode, r_401, r_bearer, r_login = asyncio.run(_drive())
+            check("authmode advertises oauth when the BFF is on",
+                  r_mode.json().get("oauth") is True)
+            check("API still gated with the BFF on: no creds -> 401",
+                  r_401.status_code == 401 and r_401.json()["ok"] is False)
+            check("ADMIN_TOKEN bearer still wins with the BFF on",
+                  r_bearer.status_code == 200 and r_bearer.json()["ok"])
+            check("SDK owns /auth/login when the BFF is on "
+                  "(fake authority -> 5xx, not 404)",
+                  r_login.status_code != 404)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

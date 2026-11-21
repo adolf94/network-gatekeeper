@@ -76,9 +76,11 @@ DNMSQ_RESTART = os.environ.get("DNMSQ_RESTART", "systemctl restart dnsmasq")
 # Where dnsmasq's log comes from (journal = systemd unit; file = container):
 LOG_SOURCE    = os.environ.get("LOG_SOURCE", "journal")   # 'journal' | 'file'
 LOG_FILE      = os.environ.get("LOG_FILE", "/var/log/gatekeeper/dnsmasq.log")
-# Admin page (ADMIN.md): a second HTTP thread in THIS process, same pattern
-# as the claim relay. Single writer preserved — web actions run the same
-# decision cores as the Telegram buttons. ADMIN_TOKEN unset = disabled.
+# Admin page (ADMIN.md): served by admin_web.py — a sibling module that
+# this one bootstraps against itself. Single writer preserved — web
+# actions run the same decision cores as the Telegram buttons. Either
+# ADMIN_TOKEN (token legs) or ADMIN_BFF_SECRET (OAuth leg) enables the
+# page; both unset = disabled (INV-5).
 # comma-separated bind list, one listener each: e.g.
 #   172.20.0.1      — the Caddy proxy network's gateway (tunnel path)
 #   192.168.213.2  — the gate's LAN address (direct approved-subnet access)
@@ -94,6 +96,23 @@ ADMIN_HOSTS  = [h.strip().lower() for h in
 ADMIN_SESSION_HOURS = int(os.environ.get("ADMIN_SESSION_HOURS", "12"))
 ADMIN_PAGE   = os.environ.get("ADMIN_PAGE", os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "admin-page.html"))
+# OAuth (ADMIN.md SEC-9): the ar-auth BFF login for the admin page.
+# ADMIN_BFF_SECRET signs the BFF session/refresh/CSRF cookies — generate
+# once (secrets.token_urlsafe(48)), persist in /etc/doorbell.env; rotating
+# it logs everyone out (documented). Unset = OAuth leg off and the page
+# keeps exactly the ADMIN_TOKEN-only behavior.
+ADMIN_BFF_SECRET = os.environ.get("ADMIN_BFF_SECRET", "")
+ADMIN_OAUTH_CLIENT = os.environ.get("ADMIN_OAUTH_CLIENT",
+                                    "network-gatekeeper")
+ADMIN_OAUTH_SCOPE = os.environ.get("ADMIN_OAUTH_SCOPE",
+                                  "api://network-gatekeeper/admin")
+# What the BROWSER sees: Caddy strips the /gatekeeper/* prefix, so the SDK
+# derives redirect_uri (base + /auth/callback — must be registered on the
+# auth server) and the cookie Path from this URL.
+ADMIN_OAUTH_BASE = os.environ.get("ADMIN_OAUTH_BASE",
+                                  "https://apis.adolfrey.com/gatekeeper")
+ADMIN_OAUTH_AUTHORITY = os.environ.get("ADMIN_OAUTH_AUTHORITY",
+                                       "auth.adolfrey.com/api")
 # Doorbell's own log sink (L-3): joins the dnsmasq log in its directory
 # (./log in the container world). Best-effort — stdout always stays.
 DOORBELL_LOG = os.environ.get("DOORBELL_LOG", os.path.join(
@@ -123,9 +142,6 @@ note_pending = {} # {"mac": ...} while waiting for the owner's note message
 # stale ✅ can never double-approve.
 knock_cards = {}
 _cards_lock = threading.Lock()
-# admin page: per-IP failed-auth timestamps (monotonic) for SEC-2's limiter
-admin_fails = {}
-_admin_fail_lock = threading.Lock()
 
 
 def log(*a):
@@ -1092,501 +1108,38 @@ def claim_server():
 
 
 # ---------------------------------------------------------------- admin page
-# ADMIN.md: the status/management page — a second HTTP thread in THIS
-# process (INV-2, same pattern as the claim relay), sharing the decision
-# cores with the Telegram buttons (INV-1: no second writer, no second
-# renderer). Bind is loopback/213.x only, never the portal IP (SEC-6);
-# auth = bearer token or a signed session cookie + Origin check (SEC-7);
-# failed logins are rate-limited (SEC-2). Handler exceptions are contained
-# (INV-4). ADMIN_TOKEN unset → the thread never starts (INV-5).
-
-_MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
-_ADMIN_ACTIONS = {"approve", "deny", "allow", "undo", "skip"}
-_ADMIN_HOURS = {4, 12, 24}          # parity with allow4/allow12/allow24
-_ADMIN_ERRORS = {
-    "pool-full": f"reserved pool {IP_PREFIX}{IP_MIN}–{IP_MAX} is full — no free IP",
-    "db": "cannot record the decision in the DB — see logs",
-    "conf-write": "cannot write the rendered config — see logs",
-    "already-approved": "device is already approved — no change",
-    "already-denied": "device is already denied — no change",
-    "already-temp": "device already has an active guest pass — no change",
-    "reload": "dnsmasq reload failed — the previous decision is still active",
-    "empty": "empty name — nothing saved",
-}
-
-
-def admin_bind_ok(bind: str) -> bool:
-    """SEC-6 self-check: never all-interfaces, never the waiting-room
-    portal IP. Refusing to start (gate unaffected) is the safe failure."""
-    return bind not in ("0.0.0.0", "192.168.214.2")
-
-
-def _sign(payload: str) -> str:
-    return hmac.new(ADMIN_TOKEN.encode(), payload.encode(),
-                    hashlib.sha256).hexdigest()
-
-
-def make_session() -> str:
-    """Cookie value `exp.sig` — HMAC keyed on ADMIN_TOKEN, so rotating the
-    token invalidates every outstanding session (documented rotation)."""
-    exp = str(int(time.time()) + ADMIN_SESSION_HOURS * 3600)
-    return f"{exp}.{_sign(exp)}"
-
-
-def check_session(value: str) -> bool:
-    if not ADMIN_TOKEN or not value:
-        return False
-    exp, _, sig = value.partition(".")
-    if not exp.isdigit() or not sig:
-        return False
-    if int(exp) < time.time():
-        return False
-    try:
-        return hmac.compare_digest(sig.encode(), _sign(exp).encode())
-    except (TypeError, UnicodeEncodeError):
-        return False        # hostile cookie payload — not our problem
-
-
-def _fail_rate_ok(ip: str) -> bool:
-    """SEC-2: fewer than 5 failed logins in the trailing minute."""
-    now = time.monotonic()
-    with _admin_fail_lock:
-        recent = [t for t in admin_fails.get(ip, []) if now - t < 60]
-        admin_fails[ip] = recent
-        return len(recent) < 5
-
-
-def _fail_record(ip: str):
-    with _admin_fail_lock:
-        admin_fails.setdefault(ip, []).append(time.monotonic())
-
-
-def _lease_map():
-    """mac -> (expires_epoch, ip, hostname) from the dnsmasq leasefile."""
-    out = {}
-    try:
-        with open(LEASEFILE) as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 4:
-                    out[parts[1].lower()] = (int(parts[0]), parts[2], parts[3])
-    except (OSError, ValueError):
-        pass
-    return out
-
-
-def _admin_roster(status: str = None, q: str = None):
-    """V-1: every known device (bindings ∪ devices) with live-lease expiry.
-    Reads only — the writer stays the decision cores."""
-    now = time.time()
-    try:
-        with _db() as con:
-            devices = {r[0]: r for r in con.execute(
-                "SELECT mac,first_seen,last_seen,last_name,status,note FROM devices")}
-            binds = {r[0]: r for r in con.execute(
-                "SELECT mac,kind,ip,lease_spec,hostname,since,expires,raw FROM bindings")}
-    except sqlite3.Error as e:
-        log("admin roster read failed:", e)
-        return []
-    leases = _lease_map()
-    rows = []
-    for mac in set(devices) | set(binds):
-        d = devices.get(mac)
-        b = binds.get(mac)
-        kind = b[1] if b else None
-        if status and (kind or "pending") != status:
-            continue
-        note = (d[5] if d else "") or ""
-        hostname = (b[4] if b else "") or ""
-        claim = visitor_names.get(mac, "")
-        if q and q not in " ".join((mac, note, hostname, claim,
-                                    (d[3] if d else "") or "")).lower():
-            continue
-        exp_in = None
-        if b and b[6]:
-            try:      # temp-pass countdown (V-1 expiry)
-                exp_in = (datetime.fromisoformat(b[6]) - datetime.now()).total_seconds()
-            except ValueError:
-                pass
-        lease = leases.get(mac)
-        rows.append({
-            "mac": mac, "name": note or hostname, "hostname": hostname,
-            "claim": claim, "kind": kind or "pending",
-            "ip": b[2] if b else None,
-            "lease_spec": b[3] if b else None,
-            "since": b[5] if b else None,
-            "expires": b[6] if b else None,
-            "expires_in": exp_in,
-            "raw": b[7] if b else None,
-            "first_seen": d[1] if d else None,
-            "last_seen": d[2] if d else None,
-            "lease_ip": lease[1] if lease else None,
-            "lease_left": int(lease[0] - now) if lease else None,
-        })
-    order = {"approve": 0, "temp": 1, "deny": 2, "raw": 3, "pending": 4}
-    rows.sort(key=lambda r: (order.get(r["kind"], 9), r["mac"]))
-    return rows
-
-
-def _admin_pending():
-    """V-2: current waiting room = live 214.x leases + claimed names."""
-    now = time.time()
-    rows = []
-    for mac, (exp, ip, host) in _lease_map().items():
-        if not ip.startswith("192.168.214."):
-            continue
-        rows.append({"mac": mac, "ip": ip,
-                     "hostname": "" if host == "*" else host,
-                     "name": notes.get(mac) or visitor_names.get(mac) or "",
-                     "expires_in": max(0, int(exp - now))})
-    rows.sort(key=lambda r: r["ip"])
-    return rows
-
-
-def _admin_events(kind: str = None, mac: str = None,
-                  limit: int = 50, offset: int = 0):
-    """L-1: audit-trail view, newest first, parameterized filters."""
-    sql = "SELECT id,ts,mac,hostname,kind,detail FROM events"
-    cond, params = [], []
-    if kind:
-        cond.append("kind=?")
-        params.append(kind)
-    if mac:
-        cond.append("mac=?")
-        params.append(mac.lower())
-    if cond:
-        sql += " WHERE " + " AND ".join(cond)
-    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
-    params += [limit, offset]
-    try:
-        with _db() as con:
-            return [dict(zip(("id", "ts", "mac", "hostname", "kind", "detail"), r))
-                    for r in con.execute(sql, params)]
-    except sqlite3.Error as e:
-        log("admin events read failed:", e)
-        return []
-
-
-def _tail_lines(path: str, n: int):
-    """L-2/L-4: last n lines, bounded read (seek near EOF, never whole-file)."""
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - n * 512))
-            return f.read().decode("utf-8", "replace").splitlines()[-n:]
-    except OSError:
-        return []
-
-
-def _dnsmasq_alive() -> bool:
-    """V-5 liveness: something already holds UDP 67 → dnsmasq is up."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.bind(("", 67))
-        return False
-    except OSError:
-        return True
-    finally:
-        s.close()
-
-
-def _admin_summary():
-    counts = {}
-    try:
-        with _db() as con:
-            for kind, n in con.execute(
-                    "SELECT kind, COUNT(*) FROM bindings GROUP BY kind"):
-                counts[kind] = n
-    except sqlite3.Error as e:
-        log("admin summary read failed:", e)
-    free = sum(1 for o in range(IP_MIN, IP_MAX + 1) if o not in used_ips())
-    return {"counts": counts,
-            "waiting": len(_admin_pending()),
-            "free_ips": free,
-            "dnsmasq_alive": _dnsmasq_alive(),
-            "doorbell_alive": True,   # the doorbell is serving this response
-            "now": datetime.now().isoformat(timespec="seconds")}
-
-
-def _load_admin_page() -> bytes:
-    try:
-        with open(ADMIN_PAGE, "rb") as f:
-            return f.read()
-    except OSError as e:
-        return (f"<!doctype html><title>gatekeeper</title><body>"
-                f"<p>admin page missing: {ADMIN_PAGE} ({e})</p>").encode()
-
-
-class AdminHandler(BaseHTTPRequestHandler):
-    """Token/session-authed admin JSON API + static page (SEC-1..SEC-8).
-    Writes dispatch to the decision cores; reads are bounded and read-only."""
-
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt, *args):
-        pass                       # 200s stay quiet; failures log() below
-
-    # ---- plumbing ----
-    def _json(self, code: int, payload: dict, set_cookie: str = None):
-        body = json.dumps(payload).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        if set_cookie:
-            self.send_header("Set-Cookie", set_cookie)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _forbidden(self):
-        # generic identical body for 403/429 — no oracle for attackers (SEC-2)
-        self._json(403, {"ok": False, "error": "forbidden"})
-
-    def _body_json(self):
-        try:
-            n = int(self.headers.get("Content-Length", "0") or "0")
-            if not 0 < n <= 8192:
-                return None
-            v = json.loads(self.rfile.read(n).decode("utf-8", "replace"))
-            return v if isinstance(v, dict) else None
-        except (ValueError, OSError):
-            return None
-
-    def _auth(self):
-        """SEC-1: 'bearer' (constant-time) or 'session' (signed cookie)."""
-        auth = self.headers.get("Authorization", "")
-        if ADMIN_TOKEN and auth.startswith("Bearer ") \
-                and hmac.compare_digest(auth[7:].encode(), ADMIN_TOKEN.encode()):
-            return "bearer"
-        for part in self.headers.get("Cookie", "").split(";"):
-            k, _, v = part.strip().partition("=")
-            if k == "gkadmin" and check_session(v):
-                return "session"
-        return None
-
-    def _origin_ok(self) -> bool:
-        """SEC-7: browser (cookie) POSTs must originate from a host we
-        actually serve — an ADMIN_HOSTS tunnel alias or any of our own
-        bind addresses. Bearer POSTs skip this: the un-forgeable header
-        is their guard."""
-        origin = self.headers.get("Origin", "")
-        host = (self.headers.get("Host") or "").strip().lower()
-        if not origin or not host:
-            return False
-        if urllib.parse.urlsplit(origin).netloc.strip().lower() != host:
-            return False
-        allowed = set(ADMIN_HOSTS) | {f"{b}:{ADMIN_PORT}" for b in ADMIN_BINDS}
-        return host in allowed
-
-    # ---- routes ----
-    def do_GET(self):
-        try:
-            path = urllib.parse.urlsplit(self.path).path
-            if path == "/":
-                body = _load_admin_page()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            if not self._auth():
-                self._json(401, {"ok": False, "error": "unauthorized"})
-                return
-            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            if path == "/api/summary":
-                payload = {"ok": True}
-                payload.update(_admin_summary())
-                self._json(200, payload)
-            elif path == "/api/devices":
-                status = q.get("status", [""])[0]
-                needle = q.get("q", [""])[0].strip().lower()
-                rows = _admin_roster(
-                    status if status in ("approve", "deny", "temp",
-                                         "raw", "pending") else None,
-                    needle or None)
-                self._json(200, {"ok": True, "devices": rows})
-            elif path == "/api/pending":
-                self._json(200, {"ok": True, "pending": _admin_pending()})
-            elif path == "/api/events":
-                kind = q.get("kind", [""])[0]
-                mac = q.get("mac", [""])[0].strip().lower()
-                try:
-                    limit = min(200, max(1, int(q.get("limit", ["50"])[0])))
-                    offset = max(0, int(q.get("offset", ["0"])[0]))
-                except ValueError:
-                    limit, offset = 50, 0
-                rows = _admin_events(kind or None,
-                                     mac if _MAC_RE.fullmatch(mac) else None,
-                                     limit, offset)
-                self._json(200, {"ok": True, "events": rows,
-                                 "limit": limit, "offset": offset})
-            elif path == "/api/logs":
-                src = q.get("src", ["doorbell"])[0]
-                try:
-                    lines = min(500, max(1, int(q.get("lines", ["200"])[0])))
-                except ValueError:
-                    lines = 200
-                src_file = LOG_FILE if src == "dnsmasq" else DOORBELL_LOG
-                self._json(200, {"ok": True, "src": src,
-                                 "lines": _tail_lines(src_file, lines)})
-            else:
-                self._json(404, {"ok": False, "error": "not found"})
-        except Exception as e:      # INV-4: never propagate out of the thread
-            log("admin GET failed:", e)
-            try:
-                self._json(500, {"ok": False, "error": "internal"})
-            except Exception:
-                pass
-
-    def do_POST(self):
-        try:
-            path = urllib.parse.urlsplit(self.path).path
-            if path == "/api/login":
-                self._login()
-                return
-            how = self._auth()
-            if not how:
-                self._json(401, {"ok": False, "error": "unauthorized"})
-                return
-            if how == "session" and not self._origin_ok():
-                log(f"admin POST rejected: bad Origin from "
-                    f"{self.client_address[0]}")
-                self._forbidden()
-                return
-            if path == "/api/action":
-                self._action()
-            elif path == "/api/note":
-                self._note()
-            elif path == "/api/logout":
-                self._json(200, {"ok": True},
-                           set_cookie="gkadmin=; Max-Age=0; Path=/; "
-                                      "HttpOnly; SameSite=Strict")
-            else:
-                self._json(404, {"ok": False, "error": "not found"})
-        except Exception as e:      # INV-4
-            log("admin POST failed:", e)
-            try:
-                self._json(500, {"ok": False, "error": "internal"})
-            except Exception:
-                pass
-
-    # ---- POST bodies ----
-    def _login(self):
-        ip = self.client_address[0]
-        if not _fail_rate_ok(ip):
-            self._forbidden()
-            return
-        token = str((self._body_json() or {}).get("token", ""))
-        if not ADMIN_TOKEN or not hmac.compare_digest(
-                token.encode("utf-8", "replace"), ADMIN_TOKEN.encode()):
-            _fail_record(ip)
-            log(f"admin login failed from {ip}")
-            self._json(401, {"ok": False, "error": "unauthorized"})
-            return
-        cookie = (f"gkadmin={make_session()}; "
-                  f"Max-Age={ADMIN_SESSION_HOURS * 3600}; Path=/; "
-                  f"HttpOnly; SameSite=Strict")
-        self._json(200, {"ok": True}, set_cookie=cookie)
-
-    def _action(self):
-        req = self._body_json() or {}
-        action = str(req.get("action", ""))
-        mac = str(req.get("mac", "")).lower()
-        if action not in _ADMIN_ACTIONS or not _MAC_RE.fullmatch(mac):
-            self._json(400, {"ok": False, "error": "bad action or mac"})
-            return
-        hours = None
-        if action == "allow":
-            try:
-                hours = int(req.get("hours"))
-            except (TypeError, ValueError):
-                self._json(400, {"ok": False, "error": "bad hours"})
-                return
-            if hours not in _ADMIN_HOURS:
-                self._json(400, {"ok": False,
-                                 "error": "hours must be 4, 12 or 24"})
-                return
-        log(f"admin action {action} {mac} from {self.client_address[0]}")
-        if action == "approve":
-            r = core_approve(mac, source="web")
-        elif action == "deny":
-            r = core_deny(mac, source="web")
-        elif action == "allow":
-            r = core_temp_allow(mac, hours, source="web")
-        elif action == "undo":
-            r = core_undo(mac, source="web")
-        else:
-            r = core_skip(mac, source="web")
-        if not r.get("ok"):
-            err = r.get("error", "unknown")
-            self._json(409, {"ok": False, "error": err,
-                             "message": _ADMIN_ERRORS.get(err, err)})
-            return
-        payload = {"ok": True, "action": action, "mac": mac}
-        if r.get("ip"):
-            payload["ip"] = r["ip"]
-        if r.get("until"):
-            payload["until"] = r["until"]
-        if not r.get("reloaded", True):
-            payload["warning"] = ("applied, but dnsmasq reload FAILED — "
-                                  "check logs")
-        self._json(200, payload)
-
-    def _note(self):
-        req = self._body_json() or {}
-        mac = str(req.get("mac", "")).lower()
-        if not _MAC_RE.fullmatch(mac):
-            self._json(400, {"ok": False, "error": "bad mac"})
-            return
-        r = core_set_note(mac, str(req.get("name", "")), source="web")
-        if not r.get("ok"):
-            self._json(400, {"ok": False, "error": "empty",
-                             "message": _ADMIN_ERRORS["empty"]})
-            return
-        payload = {"ok": True, "name": r["name"]}
-        if r.get("warning"):
-            payload["warning"] = r["warning"]
-        self._json(200, payload)
-
-
-def _admin_serve(bind: str):
-    """One bind's listener: wait for its address to exist (the proxy
-    network's gateway appears only once docker creates the network; a
-    secondary LAN IP may be added later), then serve forever. Never
-    propagates into the gate's loops (INV-4)."""
-    waited = False
-    while not stop.is_set():
-        try:
-            srv = ThreadingHTTPServer((bind, ADMIN_PORT), AdminHandler)
-            srv.daemon_threads = True
-            break
-        except OSError as e:
-            if not waited:
-                log(f"admin page waiting for {bind}:{ADMIN_PORT}: {e}")
-                waited = True
-            time.sleep(30)
-    if stop.is_set():
-        return
-    log(f"admin page listening on {bind}:{ADMIN_PORT} "
-        f"(tunnel hosts: {', '.join(ADMIN_HOSTS) or 'none configured'})")
-    srv.serve_forever()
+# ADMIN.md: the status/management page lives in admin_web.py — a sibling
+# module, split so the gate core stays lean and stdlib-only. It runs HTTP
+# threads in THIS process (INV-2) and its writes call the decision cores
+# below (INV-1: no second writer, no second renderer). Its whole stack —
+# FastAPI/uvicorn, the token/session legs (SEC-1/SEC-7), the ar-auth
+# OAuth BFF (SEC-9) — is imported lazily THERE; a box without those
+# wheels keeps a fully working gate, just no admin page (INV-4).
 
 
 def admin_server():
-    """INV-2 entry point: one listener thread per ADMIN_BINDS address.
-    Each bind is SEC-6-checked independently — a refused address never
-    blocks the others. ADMIN_TOKEN unset = nothing starts (INV-5)."""
-    if not ADMIN_TOKEN:
-        log("admin disabled — set ADMIN_TOKEN to enable the admin page")
+    """INV-2 entry point: bootstrap admin_web against THIS module — the
+    env knobs above are what it reads. The web layer owns the INV-5 gate
+    (ADMIN_TOKEN and/or ADMIN_BFF_SECRET), the per-bind SEC-6 checks,
+    and one listener thread per ADMIN_BINDS address."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)     # doorbell runs from /opt/doorbell;
+                                     # admin_web.py sits beside it
+    try:
+        import admin_web
+    except ImportError as e:
+        log("admin disabled — admin_web not importable:", e)
         return
-    for bind in ADMIN_BINDS:
-        if not admin_bind_ok(bind):
-            log(f"admin disabled for {bind} — refusing to bind "
-                f"(never all-interfaces or the portal IP)")
-            continue
-        threading.Thread(target=_admin_serve, args=(bind,), daemon=True).start()
+    core = sys.modules.get(__name__)
+    if core is None:
+        # Executed via importlib without sys.modules registration (the
+        # offline tests do this): hand admin_web a module view of THIS
+        # namespace instead. Attribute access is all it needs.
+        import types
+        core = types.ModuleType(__name__)
+        core.__dict__.update(globals())
+    admin_web.admin_server(core)
 
 
 def signal_dnsmasq() -> bool:
