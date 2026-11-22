@@ -261,6 +261,14 @@ async function rename(mac, current) {
     loadAll();
   } catch (e) { toast(e.message || "rename failed", true); loadAll(); }
 }
+async function hide(mac) {
+  try {
+    await api("api/hide", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify({mac})});
+    toast(`hidden ${mac} — reappears on a new visit, or after 24 h`);
+    loadAll();
+  } catch (e) { toast(e.message || "hide failed", true); loadAll(); }
+}
 function actBtn(label, fn) {
   const b = document.createElement("button");
   b.textContent = label; b.onclick = fn; return b;
@@ -319,6 +327,7 @@ function waitRow(w) {
   acts.appendChild(actBtn("⏳4h", () => act("allow", w.mac, 4)));
   acts.appendChild(actBtn("⏳12h", () => act("allow", w.mac, 12)));
   acts.appendChild(actBtn("😴", () => act("skip", w.mac)));
+  acts.appendChild(actBtn("🙈", () => hide(w.mac)));
   row.appendChild(acts);
   return row;
 }
@@ -367,8 +376,12 @@ async function loadDevices() {
 async function loadWaiting() {
   const j = await api("api/pending");
   const box = $("waitlist"); box.replaceChildren();
-  if (!j.pending.length) box.appendChild(empty("waiting room is empty 🛋️"));
+  if (!j.pending.length) box.appendChild(empty(j.hidden
+    ? `waiting room is empty 🛋️ — ${j.hidden} hidden`
+    : "waiting room is empty 🛋️"));
   for (const w of j.pending) box.appendChild(waitRow(w));
+  if (j.pending.length && j.hidden)
+    box.appendChild(empty(`🙈 ${j.hidden} hidden — reappears on a new visit, or after 24 h`));
 }
 async function loadEvents() {
   if (!evOffset) evOffset = 0;

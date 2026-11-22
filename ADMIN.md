@@ -73,7 +73,7 @@ hostile**, including ones that didn't come through Cloudflare.
 | ID | Criterion |
 |---|---|
 | V-1 | **Roster.** Table of every device in `bindings` + `devices`: MAC, label/note, status (approved / denied / temp / raw), reserved IP, `since`, lease spec, and **expiry**: for temp bindings a live countdown from `bindings.expires`; for approved devices the remaining lease time from the leasefile when a live lease exists. |
-| V-2 | **Waiting room.** Current knocks with age and claimed name (what `send_waiting_roster` sends), self-refreshing. Empty state says so. |
+| V-2 | **Waiting room.** Current knocks with age and claimed name (what `send_waiting_roster` sends), self-refreshing. Empty state says so. **Hide (2026-11-22):** each entry carries a 🙈 — a view-layer dismissal held in `admin_web` memory (no core call, no DB write; INV-1 untouched, restart un-hides). It reappears when its waiting-room lease is next seen gone and it knocks again, or after 24 h (`HIDE_TTL`); the caption/empty state shows the hidden count, and the Devices tab still lists the device so approve/deny stay reachable. |
 | V-3 | **Search/filter** by MAC, name, or status; sort newest-activity first. |
 | V-4 | **Device detail.** Per-device history: all `events` rows for that MAC, newest first, paginated (50/page). |
 | V-5 | **Summary strip.** Counts (approved / denied / temp / waiting), free IPs in the reserved pool (`IP_MAX − highest allocated`), and liveness: dnsmasq + doorbell last-log-line age, green/red. |

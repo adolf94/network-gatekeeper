@@ -240,6 +240,43 @@ def main():
         check("waiting room shows the pending lease",
               any(p["mac"] == NEW_MAC and p["ip"] == "192.168.214.100"
                   for p in j["pending"]))
+
+        # ---- hide (V-2 view state) ------------------------------------------
+        st, _, body = http(port, "POST", "/api/hide",
+                           {"mac": NEW_MAC}, auth)
+        check("hide -> ok", st == 200 and json.loads(body)["ok"])
+        st, _, body = http(port, "GET", "/api/pending", headers=auth)
+        j = json.loads(body)
+        check("hidden entry leaves the waiting room",
+              all(p["mac"] != NEW_MAC for p in j["pending"])
+              and j["hidden"] == 1)
+        st, _, body = http(port, "POST", "/api/hide",
+                           {"mac": "not-a-mac"}, auth)
+        check("hide with bad mac -> 400", st == 400)
+        # unhide path 1: the device leaves the room and shows up again
+        leasefile = os.environ["LEASEFILE"]
+        with open(leasefile) as f:
+            leases = f.read()
+        with open(leasefile, "w") as f:            # NEW_MAC's lease drops
+            f.write("\n".join(l for l in leases.splitlines()
+                              if NEW_MAC not in l) + "\n")
+        http(port, "GET", "/api/pending", headers=auth)   # sweep sees it gone
+        with open(leasefile, "w") as f:            # ...and a fresh lease
+            f.write(leases)
+        st, _, body = http(port, "GET", "/api/pending", headers=auth)
+        j = json.loads(body)
+        check("device seen gone + back -> unhidden",
+              any(p["mac"] == NEW_MAC for p in j["pending"])
+              and j["hidden"] == 0)
+        # unhide path 2: the hide TTL (24 h) auto-clears
+        http(port, "POST", "/api/hide", {"mac": NEW_MAC}, auth)
+        with aw._hidden_lock:
+            aw._admin_hidden[NEW_MAC] = time.time() - 25 * 3600
+        st, _, body = http(port, "GET", "/api/pending", headers=auth)
+        j = json.loads(body)
+        check("hide older than 24 h auto-clears",
+              any(p["mac"] == NEW_MAC for p in j["pending"])
+              and j["hidden"] == 0)
         st, _, body = http(port, "GET", "/api/devices", headers=auth)
         j = json.loads(body)
         check("roster lists pending device", any(

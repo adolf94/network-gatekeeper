@@ -93,6 +93,17 @@ def _fail_record(ip: str):
         admin_fails.setdefault(ip, []).append(time.monotonic())
 
 
+# V-2 view state: manually hidden waiting-room entries. Module-local on
+# purpose — a presentation preference, not a gate decision (no core
+# call, no DB write, no config render: INV-1 untouched; a restart
+# merely un-hides). Lifetime: the hide clears when a poll sees the
+# device's waiting-room lease GONE (a later appearance "shows again"
+# and is listed once more) and expires after HIDE_TTL regardless.
+_admin_hidden = {}            # mac -> hidden_at (time.time())
+_hidden_lock = threading.Lock()
+HIDE_TTL = 24 * 3600
+
+
 # ------------------------------------------------------------------ read views
 
 def _lease_map(g):
@@ -162,19 +173,36 @@ def _admin_roster(g, status: str = None, q: str = None):
     return rows
 
 
-def _admin_pending(g):
-    """V-2: current waiting room = live 214.x leases + claimed names."""
+def _admin_pending_rows(g):
+    """V-2 internals: visible waiting-room rows + how many live entries
+    are hidden. The hide sweep runs here (see _admin_hidden): a hide
+    whose waiting-room lease is seen gone clears — a fresh visit is a
+    new appearance — and so does one older than HIDE_TTL. Reads only."""
     now = time.time()
+    present = {mac: lease for mac, lease in _lease_map(g).items()
+               if lease[1].startswith("192.168.214.")}
+    with _hidden_lock:
+        for mac in list(_admin_hidden):
+            if mac not in present or now - _admin_hidden[mac] >= HIDE_TTL:
+                del _admin_hidden[mac]   # left the room / TTL ran out
+        hidden = {m for m in _admin_hidden if m in present}
     rows = []
-    for mac, (exp, ip, host) in _lease_map(g).items():
-        if not ip.startswith("192.168.214."):
+    for mac, (exp, ip, host) in present.items():
+        if mac in hidden:
             continue
         rows.append({"mac": mac, "ip": ip,
                      "hostname": "" if host == "*" else host,
                      "name": g.notes.get(mac) or g.visitor_names.get(mac) or "",
                      "expires_in": max(0, int(exp - now))})
     rows.sort(key=lambda r: r["ip"])
-    return rows
+    return rows, len(hidden)
+
+
+def _admin_pending(g):
+    """V-2: current waiting room (visible entries) — what the summary
+    counts; the API serves _admin_pending_rows so the page can also say
+    how many are hidden."""
+    return _admin_pending_rows(g)[0]
 
 
 def _admin_events(g, kind: str = None, mac: str = None,
@@ -512,7 +540,8 @@ def build_admin_app(g):
 
     @app.get("/api/pending")
     async def _pending(how: str = _A):
-        return {"ok": True, "pending": _admin_pending(g)}
+        rows, hidden = _admin_pending_rows(g)
+        return {"ok": True, "pending": rows, "hidden": hidden}
 
     @app.get("/api/events")
     async def _events(kind: str = "", mac: str = "",
@@ -634,6 +663,24 @@ def build_admin_app(g):
         if r.get("warning"):
             payload["warning"] = r["warning"]
         return JSONResponse(status_code=200, content=payload)
+
+    @app.post("/api/hide")
+    async def _hide(request: Request, how: str = _A):
+        # V-2 view preference (INV-1 untouched): dismiss a waiting-room
+        # entry from the page — no core call, no DB write. The hide
+        # clears when the device is next seen gone from the room (a
+        # fresh visit "shows again"), or after HIDE_TTL. The Devices
+        # tab keeps listing the device, so approve/deny stay reachable.
+        req = await _admin_json_body(request) or {}
+        mac = str(req.get("mac", "")).lower()
+        if not _MAC_RE.fullmatch(mac):
+            return JSONResponse(status_code=400,
+                                content={"ok": False, "error": "bad mac"})
+        with _hidden_lock:
+            _admin_hidden[mac] = time.time()
+        g.log(f"admin hide {mac} from "
+              f"{request.client.host if request.client else '?'}")
+        return {"ok": True, "mac": mac}
 
     return app
 
