@@ -420,10 +420,12 @@ def build_admin_app(g):
 
             app.router.lifespan_context = _tolerant_warmup
 
-            # SDK ≥ 1.3.1 required (the Dockerfile pins the exact wheel):
-            # its restart redirects target the PUBLIC login path
-            # (bff.py::_restart_redirect) and callback failures log their
-            # reason (docker logs: "ar-auth BFF: callback failed…").
+            # SDK ≥ 1.3.2 required (the Dockerfile pins the exact wheel):
+            # restart redirects target the PUBLIC login path
+            # (bff.py::_restart_redirect), callback failures log their
+            # reason (docker logs: "ar-auth BFF: callback failed…"),
+            # and post-login landings without a returnUrl resolve to
+            # the app's public base path instead of the bare site root.
             # 1.3.0's prefix-blind restarts sent failed logins to a dead
             # root URL (observed 2026-11-22: callback answered
             # 302 Location /auth/login past the handle_path route); the

@@ -64,7 +64,7 @@ hostile**, including ones that didn't come through Cloudflare.
 | SEC-6 | Startup self-check: if `ADMIN_BIND` is `0.0.0.0` or `192.168.214.2`, the admin thread refuses to start and logs why (gate keeps running). |
 | SEC-7 | **Browser auth is a flow, not a header.** Browsers can't send Bearer headers on navigation: the page offers a token login form → the server sets a signed, HttpOnly, `SameSite=Strict` session cookie (short TTL, 12 h suggested); every POST additionally requires an Origin check against the configured hostname allowlist (`ADMIN_HOSTS`). Constant-time compare applies at login; programmatic/automation access keeps the Bearer header. |
 | SEC-8 | **Transport decision — RECORDED (2026-11-21):** the admin binds the **Caddy proxy network's gateway IP** (`ADMIN_BIND=172.20.0.1`), not the LAN. Reachability: the host itself + containers on the `proxy` network (Caddy) — and, because the host routes for them, approved-subnet clients could address the gateway IP directly too; the token + rate limit remain the guard. TLS is terminated at Cloudflare → cloudflared → Caddy, so browser-to-host traffic is encrypted the whole way; Caddy→doorbell is a plain hop across the host's own bridge. LAN clients hitting `https://apis.adolfrey.com` on 443 directly fall into the portal catch-all site, not the admin — so in practice the page is **tunnel-only**, with loopback for debugging. |
-| SEC-9 | **OAuth (ar-auth BFF) — added 2026-11-22.** A third auth leg next to SEC-1/SEC-7: the ar-auth authorization-code flow with PKCE (`scripts/admin_web.py`, SDK `ar-auth-python-client[fastapi]` **≥1.3.1** from GitHub Releases — the same wheel the Dockerfile pins; 1.3.1 targets restart redirects at the public path). The BFF owns `/auth/login|callback|logout`; the session cookie is app-local, HttpOnly, `SameSite=Lax`, `Path=/gatekeeper/` (host-only, `gatekeeper.`-prefixed names); silent renewal from the parked encrypted refresh token (single-flight); CSRF = Lax + Origin + signed double-submit (`XSRF-TOKEN` cookie echoed by the page as `X-CSRF-Token`). **The gate is the scope:** login requires `api://network-gatekeeper/admin`, verified on the login exchange's ACCESS token — ar-auth id_tokens carry no scopes and the code grant narrows silently, so `ScopeGatedBff` wraps the AuthLib code-exchange call, signature-verifies the access token's `scope` claim, and rejects logins without it (fail closed; missing-grant users bounce back to the login page). Revocation lags up to the refresh chain's life (30 d) — same trade-off as every ar-auth BFF consumer. ADMIN_TOKEN legs unchanged; Bearer always wins precedence. | Same-site cookie rule (ar-oauth2 `docs/cookie-auth-plan.md`): `apis.adolfrey.com` shares the registrable domain with `auth.adolfrey.com` — cookie auth is viable, and no token ever reaches JavaScript |
+| SEC-9 | **OAuth (ar-auth BFF) — added 2026-11-22.** A third auth leg next to SEC-1/SEC-7: the ar-auth authorization-code flow with PKCE (`scripts/admin_web.py`, SDK `ar-auth-python-client[fastapi]` **≥1.3.2** from GitHub Releases — the same wheel the Dockerfile pins; 1.3.2 targets restart redirects at the public path and resolves post-login landings to the app's public base path). The BFF owns `/auth/login|callback|logout`; the session cookie is app-local, HttpOnly, `SameSite=Lax`, `Path=/gatekeeper/` (host-only, `gatekeeper.`-prefixed names); silent renewal from the parked encrypted refresh token (single-flight); CSRF = Lax + Origin + signed double-submit (`XSRF-TOKEN` cookie echoed by the page as `X-CSRF-Token`). **The gate is the scope:** login requires `api://network-gatekeeper/admin`, verified on the login exchange's ACCESS token — ar-auth id_tokens carry no scopes and the code grant narrows silently, so `ScopeGatedBff` wraps the AuthLib code-exchange call, signature-verifies the access token's `scope` claim, and rejects logins without it (fail closed; missing-grant users bounce back to the login page). Revocation lags up to the refresh chain's life (30 d) — same trade-off as every ar-auth BFF consumer. ADMIN_TOKEN legs unchanged; Bearer always wins precedence. | Same-site cookie rule (ar-oauth2 `docs/cookie-auth-plan.md`): `apis.adolfrey.com` shares the registrable domain with `auth.adolfrey.com` — cookie auth is viable, and no token ever reaches JavaScript |
 
 ---
 
@@ -270,7 +270,7 @@ Failure modes, all fail-closed:
 - **Missing scope grant** — login completes at the auth server but the
   exchange is rejected: you bounce back to the (prefixed) sign-in link —
   the auth server's code grant narrows silently, our gate is the
-  access-token scope check, and the SDK (≥1.3.1) restarts to the public
+  access-token scope check, and the SDK (≥1.3.2) restarts to the public
   login path, logging the reason (`docker logs`:
   `ar-auth BFF: callback failed, restarting login (…)`). Grant the scope,
   done.
@@ -285,15 +285,17 @@ token legs live) → unset both (page off, INV-5) → stop cloudflared (page
 unreachable, gate fine).
 
 Notes for the future:
-- **SDK restart redirects — FIXED upstream in 1.3.1 (2026-11-22).** The
+- **SDK restart redirects — FIXED upstream (1.3.1, re-carried in 1.3.2
+  with the post-login landing fix; 2026-11-22).** The
   1.3.0 BFF restarted failed logins with a redirect to the BARE
   `login_path` — behind the prefix-stripping proxy that Location lost
   `/gatekeeper` and the browser landed on a dead root URL (observed
-  live: callback answered `302 Location /auth/login`). 1.3.1's
-  `_restart_redirect` targets the public path (same resolution rule as
-  the redirect_uri) and logs the failure reason; our interim workaround
-  middleware was removed with the bump. The Dockerfile pins the wheel —
-  keep it ≥1.3.1.
+  live: callback answered `302 Location /auth/login`). The fix targets
+  the public path (same resolution rule as the redirect_uri) and logs
+  the failure reason; 1.3.2 additionally resolves no-returnUrl
+  landings to the app's public base path instead of the bare site
+  root. Our interim workaround middleware was removed with the bump.
+  The Dockerfile pins the wheel — keep it ≥1.3.2.
 - **Revocation lag:** a granted session silently renews from its parked
   refresh token for up to 30 days even after a server-side scope/user
   change — the refreshed id_token carries no scopes to re-check. To cut

@@ -15,7 +15,7 @@ RUN apt-get update \
     # externally managed — the container is the sole owner of this
     # interpreter, so --break-system-packages is safe here.
     && pip3 install --no-cache-dir --break-system-packages \
-         "ar-auth-python-client[fastapi] @ https://github.com/adolf94/ar-oauth2/releases/download/1.3.1/ar_auth_python_client-1.3.1-py3-none-any.whl" \
+         "ar-auth-python-client[fastapi] @ https://github.com/adolf94/ar-oauth2/releases/download/1.3.2/ar_auth_python_client-1.3.2-py3-none-any.whl" \
          uvicorn \
     && python3 -c "import ar_auth.bff, fastapi, uvicorn" \
     && dnsmasq --version | head -1
