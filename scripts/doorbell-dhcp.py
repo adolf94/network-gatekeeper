@@ -106,11 +106,17 @@ ADMIN_OAUTH_CLIENT = os.environ.get("ADMIN_OAUTH_CLIENT",
                                     "network-gatekeeper")
 ADMIN_OAUTH_SCOPE = os.environ.get("ADMIN_OAUTH_SCOPE",
                                   "api://network-gatekeeper/admin")
-# What the BROWSER sees: Caddy strips the /gatekeeper/* prefix, so the SDK
-# derives redirect_uri (base + /auth/callback — must be registered on the
-# auth server) and the cookie Path from this URL.
+# What the BROWSER sees. The SDK builds redirect_uri VERBATIM as
+# public_base_url + /auth/callback (bff.py::_redirect_uri — the request
+# host is only a fallback when this is unset), so this must equal the
+# auth-server registration minus "/auth/callback", host AND path. Live
+# (2026-11-22): the page rides the /gatekeeper/* prefix on the apps
+# host (Caddy handle_path strips it before the doorbell) — the
+# registration MUST retain the prefix:
+# https://apps.adolfrey.com/gatekeeper/auth/callback. Cookie Path
+# /gatekeeper/.
 ADMIN_OAUTH_BASE = os.environ.get("ADMIN_OAUTH_BASE",
-                                  "https://apis.adolfrey.com/gatekeeper")
+                                  "https://apps.adolfrey.com/gatekeeper")
 ADMIN_OAUTH_AUTHORITY = os.environ.get("ADMIN_OAUTH_AUTHORITY",
                                        "auth.adolfrey.com/api")
 # Doorbell's own log sink (L-3): joins the dnsmasq log in its directory

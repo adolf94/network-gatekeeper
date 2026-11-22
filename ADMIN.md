@@ -64,7 +64,7 @@ hostile**, including ones that didn't come through Cloudflare.
 | SEC-6 | Startup self-check: if `ADMIN_BIND` is `0.0.0.0` or `192.168.214.2`, the admin thread refuses to start and logs why (gate keeps running). |
 | SEC-7 | **Browser auth is a flow, not a header.** Browsers can't send Bearer headers on navigation: the page offers a token login form → the server sets a signed, HttpOnly, `SameSite=Strict` session cookie (short TTL, 12 h suggested); every POST additionally requires an Origin check against the configured hostname allowlist (`ADMIN_HOSTS`). Constant-time compare applies at login; programmatic/automation access keeps the Bearer header. |
 | SEC-8 | **Transport decision — RECORDED (2026-11-21):** the admin binds the **Caddy proxy network's gateway IP** (`ADMIN_BIND=172.20.0.1`), not the LAN. Reachability: the host itself + containers on the `proxy` network (Caddy) — and, because the host routes for them, approved-subnet clients could address the gateway IP directly too; the token + rate limit remain the guard. TLS is terminated at Cloudflare → cloudflared → Caddy, so browser-to-host traffic is encrypted the whole way; Caddy→doorbell is a plain hop across the host's own bridge. LAN clients hitting `https://apis.adolfrey.com` on 443 directly fall into the portal catch-all site, not the admin — so in practice the page is **tunnel-only**, with loopback for debugging. |
-| SEC-9 | **OAuth (ar-auth BFF) — added 2026-11-22.** A third auth leg next to SEC-1/SEC-7: the ar-auth authorization-code flow with PKCE (`scripts/admin_web.py`, SDK `ar-auth-python-client[fastapi]` 1.3.0 from GitHub Releases — the same wheel the Dockerfile installs). The BFF owns `/auth/login|callback|logout`; the session cookie is app-local, HttpOnly, `SameSite=Lax`, `Path=/gatekeeper/` (host-only, path-prefixed names); silent renewal from the parked encrypted refresh token (single-flight); CSRF = Lax + Origin + signed double-submit (`XSRF-TOKEN` cookie echoed by the page as `X-CSRF-Token`). **The gate is the scope:** login requires `api://network-gatekeeper/admin`, verified on the login exchange's ACCESS token — ar-auth id_tokens carry no scopes and the code grant narrows silently, so `ScopeGatedBff` wraps the AuthLib code-exchange call, signature-verifies the access token's `scope` claim, and rejects logins without it (fail closed; missing-grant users bounce back to the login page). Revocation lags up to the refresh chain's life (30 d) — same trade-off as every ar-auth BFF consumer. ADMIN_TOKEN legs unchanged; Bearer always wins precedence. | Same-site cookie rule (ar-oauth2 `docs/cookie-auth-plan.md`): `apis.adolfrey.com` shares the registrable domain with `auth.adolfrey.com` — cookie auth is viable, and no token ever reaches JavaScript |
+| SEC-9 | **OAuth (ar-auth BFF) — added 2026-11-22.** A third auth leg next to SEC-1/SEC-7: the ar-auth authorization-code flow with PKCE (`scripts/admin_web.py`, SDK `ar-auth-python-client[fastapi]` **≥1.3.1** from GitHub Releases — the same wheel the Dockerfile pins; 1.3.1 targets restart redirects at the public path). The BFF owns `/auth/login|callback|logout`; the session cookie is app-local, HttpOnly, `SameSite=Lax`, `Path=/gatekeeper/` (host-only, `gatekeeper.`-prefixed names); silent renewal from the parked encrypted refresh token (single-flight); CSRF = Lax + Origin + signed double-submit (`XSRF-TOKEN` cookie echoed by the page as `X-CSRF-Token`). **The gate is the scope:** login requires `api://network-gatekeeper/admin`, verified on the login exchange's ACCESS token — ar-auth id_tokens carry no scopes and the code grant narrows silently, so `ScopeGatedBff` wraps the AuthLib code-exchange call, signature-verifies the access token's `scope` claim, and rejects logins without it (fail closed; missing-grant users bounce back to the login page). Revocation lags up to the refresh chain's life (30 d) — same trade-off as every ar-auth BFF consumer. ADMIN_TOKEN legs unchanged; Bearer always wins precedence. | Same-site cookie rule (ar-oauth2 `docs/cookie-auth-plan.md`): `apis.adolfrey.com` shares the registrable domain with `auth.adolfrey.com` — cookie auth is viable, and no token ever reaches JavaScript |
 
 ---
 
@@ -163,7 +163,7 @@ check green before the next.
 | `ADMIN_BFF_SECRET` | *(unset)* | **OAuth BFF (SEC-9).** Unset ⇒ OAuth leg off, token-only behavior unchanged. Generate once: `python3 -c "import secrets; print(secrets.token_urlsafe(48))"` → `/etc/doorbell.env`. Signs the BFF session/refresh/CSRF cookies — persist it; rotating logs everyone out. Either this or `ADMIN_TOKEN` enables the page (INV-5) |
 | `ADMIN_OAUTH_CLIENT` | `network-gatekeeper` | ar-auth client_id (registered as a PUBLIC client — PKCE, no secret) |
 | `ADMIN_OAUTH_SCOPE` | `api://network-gatekeeper/admin` | Required scope, checked on the login exchange's access token — grant it to the client and your user on the auth server |
-| `ADMIN_OAUTH_BASE` | `https://apis.adolfrey.com/gatekeeper` | Browser-visible base URL (Caddy strips `/gatekeeper/*`). redirect_uri = base + `/auth/callback` — must match the client registration exactly; cookies are scoped to the path |
+| `ADMIN_OAUTH_BASE` | `https://apps.adolfrey.com/gatekeeper` | Browser-visible base URL. The SDK builds redirect_uri **verbatim** as base + `/auth/callback` (`bff.py::_redirect_uri` — the request host is only a fallback), so it must equal the auth-server registration minus `/auth/callback`, host AND path — the `/gatekeeper` prefix is part of it (Caddy `handle_path` strips it before the doorbell). Live: redirect `https://apps.adolfrey.com/gatekeeper/auth/callback`, cookie `Path=/gatekeeper/` |
 | `ADMIN_OAUTH_AUTHORITY` | `auth.adolfrey.com/api` | The ar-auth issuer (SDK default) |
 | `ADMIN_HOSTS` | *(unset)* | Comma-separated hostname allowlist for Origin/Host checks, e.g. `apis.adolfrey.com,apps.adolfrey.com`. Unset ⇒ only direct bind-address access (loopback / 213.x forms) is accepted; any tunnel hostname must be listed explicitly |
 | `DOORBELL_LOG` | `<LOG_FILE dir>/doorbell.log` | The doorbell's second log sink (L-3) — truncated on start; joins the dnsmasq log in `./log` (no separate LOG_DIR knob: the sink always lives beside LOG_FILE) |
@@ -186,6 +186,27 @@ browser ─TLS─ Cloudflare ─ cloudflared ─ 127.0.0.1:8080 (caddy)
 - `cloudflared` already exists in the Caddy stack (native, targets
   `127.0.0.1:8080`); no new tunnel, no new DNS. `apps.adolfrey.com` works
   automatically (same Caddy site block; sessions stay per-hostname, SEC-7).
+- **OAuth is pinned to the apps host /gatekeeper prefix (recorded
+  2026-11-22):** `ADMIN_OAUTH_BASE=https://apps.adolfrey.com/gatekeeper`,
+  registered redirect `https://apps.adolfrey.com/gatekeeper/auth/callback`.
+  No new Caddy routes — the same `handle_path /gatekeeper/*` route in the
+  shared site block already serves the page on `apps.adolfrey.com` (and on
+  `apis.adolfrey.com`), and the SDK derives cookie `Path=/gatekeeper/` from
+  the base. Sign in at `https://apps.adolfrey.com/gatekeeper/`; BFF cookies
+  are host+path-scoped there.
+- **Failure discriminator (recorded 2026-11-22):** `handle_path` is an
+  *internal* rewrite — it never emits a 302. If a request to
+  `/gatekeeper/<x>` comes back `302 Location: /<x>` (prefix stripped,
+  relative), the route is a strip-*redirect* rule (e.g.
+  `redir /gatekeeper/{path} /{path}`) masquerading as the handle: the
+  browser is bounced to the unprefixed path, which nothing serves, and
+  every prefixed URL dies the same way — login AND callback. (Bite:
+  2026-11-22, apps host — the doorbell cannot produce such a redirect,
+  because behind `handle_path` it never sees the prefix.) Fix:
+  `handle_path /gatekeeper/* { reverse_proxy 172.20.0.1:8340 }` +
+  `caddy reload`. Quick check:
+  `curl -sI https://apps.adolfrey.com/gatekeeper/auth/login` — the
+  Location must be the IdP authorize URL, never `/auth/login`.
 - **Why the gateway IP:** `gatekeeper-core` is `network_mode: host`, and
   Docker forbids host-mode containers from joining bridge networks — so the
   doorbell cannot appear as `gatekeeper:8340` on `proxy`. Binding the
@@ -217,9 +238,13 @@ the gate core — the core stays stdlib-only and imports it lazily, INV-4).
 1. **Auth server (ar-auth dashboard):** register the client —
    - client_id `network-gatekeeper`, **public client** (no secret; PKCE
      mandatory — the SDK enforces S256),
-   - redirect URI `https://apis.adolfrey.com/gatekeeper/auth/callback`
-     (exactly; `apps.adolfrey.com` sessions are per-hostname — a second
-     redirect URI for that host works if you want OAuth there too),
+   - redirect URI `https://apps.adolfrey.com/gatekeeper/auth/callback`
+     — exactly this, host AND path. The SDK builds redirect_uri
+     **verbatim** from `ADMIN_OAUTH_BASE` (request host is only a
+     fallback), and the auth server honors the *registration* — a URI
+     that drops the `/gatekeeper` prefix (first attempt, 2026-11-22)
+     silently bounces the callback to the bare host root, past the
+     prefix-stripping route, and the login dies with a 404,
    - allowed scopes include `api://network-gatekeeper/admin`; grant the
      scope to your user.
 2. **Gate host (`/etc/doorbell.env`):** add
@@ -233,7 +258,7 @@ the gate core — the core stays stdlib-only and imports it lazily, INV-4).
 
 ### Flow (VER-6 — one live check end-to-end)
 
-Open `https://apis.adolfrey.com/gatekeeper/` → the login dialog offers
+Open `https://apps.adolfrey.com/gatekeeper/` → the login dialog offers
 **Sign in with ar-auth** (the page probes `/api/authmode`) → authenticate
 at `auth.adolfrey.com` → back on the page, signed in: session cookie
 `gatekeeper.ar_bff_session` (HttpOnly), parked refresh + readable
@@ -243,9 +268,12 @@ Sign-out (⏻) clears both worlds (`/auth/logout` + the token cookie).
 
 Failure modes, all fail-closed:
 - **Missing scope grant** — login completes at the auth server but the
-  exchange is rejected: you bounce back to the sign-in link (the auth
-  server's code grant narrows silently; our gate is the access-token
-  scope check). Grant the scope, done.
+  exchange is rejected: you bounce back to the (prefixed) sign-in link —
+  the auth server's code grant narrows silently, our gate is the
+  access-token scope check, and the SDK (≥1.3.1) restarts to the public
+  login path, logging the reason (`docker logs`:
+  `ar-auth BFF: callback failed, restarting login (…)`). Grant the scope,
+  done.
 - **Auth server unreachable** — the page still loads (warmup is
   tolerant, unlike the SDK default); sign-in fails until it resolves.
   The gate is never affected.
@@ -257,6 +285,15 @@ token legs live) → unset both (page off, INV-5) → stop cloudflared (page
 unreachable, gate fine).
 
 Notes for the future:
+- **SDK restart redirects — FIXED upstream in 1.3.1 (2026-11-22).** The
+  1.3.0 BFF restarted failed logins with a redirect to the BARE
+  `login_path` — behind the prefix-stripping proxy that Location lost
+  `/gatekeeper` and the browser landed on a dead root URL (observed
+  live: callback answered `302 Location /auth/login`). 1.3.1's
+  `_restart_redirect` targets the public path (same resolution rule as
+  the redirect_uri) and logs the failure reason; our interim workaround
+  middleware was removed with the bump. The Dockerfile pins the wheel —
+  keep it ≥1.3.1.
 - **Revocation lag:** a granted session silently renews from its parked
   refresh token for up to 30 days even after a server-side scope/user
   change — the refreshed id_token carries no scopes to re-check. To cut

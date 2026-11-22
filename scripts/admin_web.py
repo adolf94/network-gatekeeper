@@ -357,8 +357,13 @@ def _make_oauth_bff(g):
         client_id=g.ADMIN_OAUTH_CLIENT,
         secret=g.ADMIN_BFF_SECRET,
         authority=g.ADMIN_OAUTH_AUTHORITY,
-        # what the browser sees: Caddy strips /gatekeeper/* — the SDK
-        # derives redirect_uri (…/auth/callback) and the cookie Path from it
+        # The SDK derives redirect_uri (base + /auth/callback) and the
+        # cookie Path from this, VERBATIM — it must equal the
+        # auth-server registration minus /auth/callback, host AND path:
+        # the /gatekeeper prefix is real (Caddy handle_path strips it
+        # before us). Live: redirect
+        # https://apps.adolfrey.com/gatekeeper/auth/callback, cookie
+        # Path=/gatekeeper/
         public_base_url=g.ADMIN_OAUTH_BASE,
         scope=f"openid profile email {g.ADMIN_OAUTH_SCOPE}",
     )
@@ -414,6 +419,15 @@ def build_admin_app(g):
                     yield
 
             app.router.lifespan_context = _tolerant_warmup
+
+            # SDK ≥ 1.3.1 required (the Dockerfile pins the exact wheel):
+            # its restart redirects target the PUBLIC login path
+            # (bff.py::_restart_redirect) and callback failures log their
+            # reason (docker logs: "ar-auth BFF: callback failed…").
+            # 1.3.0's prefix-blind restarts sent failed logins to a dead
+            # root URL (observed 2026-11-22: callback answered
+            # 302 Location /auth/login past the handle_path route); the
+            # workaround middleware we carried for it was removed here.
         except ImportError as e:
             g.log(f"admin oauth DISABLED — ar-auth SDK not installed ({e}); "
                   "the ADMIN_TOKEN legs stay active")

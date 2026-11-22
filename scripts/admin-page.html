@@ -185,8 +185,9 @@ function toast(msg, bad) {
   clearTimeout(toast._t); toast._t = setTimeout(() => t.style.display = "none", 4000);
 }
 /* OAuth (ar-auth BFF, ADMIN.md SEC-9): sign-in/out are plain navigations.
-   The browser URL keeps Caddy's /gatekeeper prefix, so links rebuild it;
-   returnUrl must land back on the prefixed page, not the host root. */
+   The SDK's redirect/cookies are pinned to ADMIN_OAUTH_BASE — the apps
+   host /gatekeeper prefix — so the links below rebuild that prefix from
+   the page URL; returnUrl lands back on the prefixed page. */
 let OAUTH = false;
 function authHref(path) {
   const pre = location.pathname.indexOf("/gatekeeper") === 0 ? "/gatekeeper" : "";
